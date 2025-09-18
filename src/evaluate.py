@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -11,7 +12,16 @@ import Levenshtein as Lev
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --------------------------
-# Dataset Loader (reuse from train.py)
+# Paths (relative)
+# --------------------------
+PROCESSED_DIR = os.path.join("data", "processed")
+VOCAB_DIR = os.path.join(PROCESSED_DIR, "vocab")
+TEST_FILE = os.path.join(PROCESSED_DIR, "test.csv")
+MODELS_DIR = os.path.join("models")
+BEST_MODEL = os.path.join(MODELS_DIR, "best_model.pth")
+
+# --------------------------
+# Dataset Loader
 # --------------------------
 class TranslationDataset(torch.utils.data.Dataset):
     def __init__(self, csv_file, sp_urdu, sp_roman, max_len=50):
@@ -42,10 +52,10 @@ def collate_fn(batch):
 # Evaluation
 # --------------------------
 def evaluate_model():
-    sp_urdu = spm.SentencePieceProcessor(model_file="data/processed/vocab/urdu_bpe.model")
-    sp_roman = spm.SentencePieceProcessor(model_file="data/processed/vocab/roman_bpe.model")
+    sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(VOCAB_DIR, "urdu_bpe.model"))
+    sp_roman = spm.SentencePieceProcessor(model_file=os.path.join(VOCAB_DIR, "roman_bpe.model"))
 
-    test_ds = TranslationDataset("data/processed/test.csv", sp_urdu, sp_roman)
+    test_ds = TranslationDataset(TEST_FILE, sp_urdu, sp_roman)
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
 
     INPUT_DIM = sp_urdu.get_piece_size()
@@ -55,7 +65,7 @@ def evaluate_model():
     decoder = Decoder(OUTPUT_DIM, 256, 512, n_layers=4, dropout=0.3)
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
-    model.load_state_dict(torch.load("models/best_model.pth", map_location=DEVICE))
+    model.load_state_dict(torch.load(BEST_MODEL, map_location=DEVICE))
     model.eval()
 
     bleu_scores, cers = [], []

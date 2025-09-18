@@ -19,11 +19,16 @@ class Encoder(nn.Module):
         embedded = self.dropout(self.embedding(src))
         outputs, (hidden, cell) = self.rnn(embedded)
 
-        # concatenate bidirectional hidden states and pass through FC
-        hidden = torch.tanh(self.fc(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)))
-        hidden = hidden.unsqueeze(0)  # add num_layers dimension
+        # hidden, cell from BiLSTM: [num_layers*2, batch, hid_dim]
+        # We only need the last forward and backward hidden states
+        hidden_cat = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
+        hidden_proj = torch.tanh(self.fc(hidden_cat))  # [batch, hid_dim]
 
-        return outputs, hidden, cell
+        # Expand to match decoder's 4 layers
+        hidden_proj = hidden_proj.unsqueeze(0).repeat(4, 1, 1)
+        cell_proj = torch.zeros_like(hidden_proj)
+
+        return outputs, hidden_proj, cell_proj
 
 
 # --------------------------
@@ -66,7 +71,7 @@ class Seq2Seq(nn.Module):
         outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
 
         _, hidden, cell = self.encoder(src)
-        input = trg[:, 0]  # first token = <sos>
+        input = trg[:, 0]  # <sos>
 
         for t in range(1, trg_len):
             output, hidden, cell = self.decoder(input, hidden, cell)

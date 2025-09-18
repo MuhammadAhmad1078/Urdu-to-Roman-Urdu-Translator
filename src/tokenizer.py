@@ -3,7 +3,7 @@ import pandas as pd
 import sentencepiece as spm
 
 # --------------------------
-# CONFIG
+# CONFIG (relative paths)
 # --------------------------
 PROCESSED_DIR = os.path.join("data", "processed")
 TRAIN_FILE = os.path.join(PROCESSED_DIR, "train.csv")
@@ -34,7 +34,7 @@ def train_bpe(vocab_size=8000, character_coverage=1.0):
     urdu_texts = df["urdu_text"].astype(str).tolist()
     roman_texts = df["roman_text"].astype(str).tolist()
 
-    # Save temp files for SentencePiece training
+    # Temp files for SentencePiece training
     urdu_tmp = os.path.join(VOCAB_DIR, "urdu_tmp.txt")
     roman_tmp = os.path.join(VOCAB_DIR, "roman_tmp.txt")
 
@@ -61,12 +61,12 @@ def train_bpe(vocab_size=8000, character_coverage=1.0):
         model_type="bpe"
     )
 
-    # Remove temp files
+    # Clean up temp files
     os.remove(urdu_tmp)
     os.remove(roman_tmp)
 
-    print(f"Urdu BPE model saved: {URDU_MODEL}")
-    print(f"Roman Urdu BPE model saved: {ROMAN_MODEL}")
+    print(f"✅ Urdu BPE model saved: {URDU_MODEL}")
+    print(f"✅ Roman Urdu BPE model saved: {ROMAN_MODEL}")
 
 # --------------------------
 # LOAD TOKENIZERS
@@ -91,7 +91,7 @@ def tokenize_and_save(df, urdu_tok, roman_tok, out_path):
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     pd.DataFrame(tokenized_data).to_csv(out_path, index=False)
-    print(f"Saved tokenized dataset: {out_path} ({len(tokenized_data)} pairs)")
+    print(f"✅ Saved tokenized dataset: {out_path} ({len(tokenized_data)} pairs)")
 
 def process_all_splits():
     urdu_tok, roman_tok = load_tokenizers()

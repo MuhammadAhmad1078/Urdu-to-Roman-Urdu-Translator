@@ -39,15 +39,20 @@ def collate_fn(batch):
     return src, trg
 
 # --------------------------
-# Training Loop
+# Training Loop with Early Stopping
 # --------------------------
 def train_model():
-    # Load tokenizers
-    sp_urdu = spm.SentencePieceProcessor(model_file="data/processed/vocab/urdu_bpe.model")
-    sp_roman = spm.SentencePieceProcessor(model_file="data/processed/vocab/roman_bpe.model")
+    # Base directories (relative)
+    DATA_DIR = os.path.join("data", "processed")
+    VOCAB_DIR = os.path.join(DATA_DIR, "vocab")
+    MODELS_DIR = os.path.join("models")
 
-    train_ds = TranslationDataset("data/processed/train.csv", sp_urdu, sp_roman)
-    valid_ds = TranslationDataset("data/processed/valid.csv", sp_urdu, sp_roman)
+    # Load tokenizers
+    sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(VOCAB_DIR, "urdu_bpe.model"))
+    sp_roman = spm.SentencePieceProcessor(model_file=os.path.join(VOCAB_DIR, "roman_bpe.model"))
+
+    train_ds = TranslationDataset(os.path.join(DATA_DIR, "train.csv"), sp_urdu, sp_roman)
+    valid_ds = TranslationDataset(os.path.join(DATA_DIR, "valid.csv"), sp_urdu, sp_roman)
 
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
@@ -66,8 +71,10 @@ def train_model():
     criterion = nn.CrossEntropyLoss(ignore_index=0)  # ignore <pad>
 
     best_valid_loss = float("inf")
+    patience = 3   # stop if no improvement for 3 epochs
+    counter = 0
 
-    for epoch in range(10):  # train for 10 epochs (adjustable)
+    for epoch in range(30):  # allow up to 30 epochs, but early stop
         model.train()
         epoch_loss = 0
         for src, trg in train_loader:
@@ -108,8 +115,16 @@ def train_model():
 
         if val_loss < best_valid_loss:
             best_valid_loss = val_loss
-            torch.save(model.state_dict(), "models/best_model.pth")
-            print("Model saved!")
+            counter = 0
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(MODELS_DIR, "best_model.pth"))
+            print("✅ Model improved & saved!")
+        else:
+            counter += 1
+            print(f"⚠️ No improvement. Patience {counter}/{patience}")
+            if counter >= patience:
+                print("⏹️ Early stopping triggered.")
+                break
 
 if __name__ == "__main__":
     train_model()
