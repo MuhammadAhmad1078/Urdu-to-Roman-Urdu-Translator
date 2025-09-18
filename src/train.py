@@ -172,7 +172,7 @@ if __name__ == "__main__":
     DROPOUT = 0.3
     BATCH_SIZE = 128
     LEARNING_RATE = 1e-4
-    N_EPOCHS = 10 # You can increase this for longer training
+    N_EPOCHS = 40 # You can increase this for longer training
     CLIP = 1
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
