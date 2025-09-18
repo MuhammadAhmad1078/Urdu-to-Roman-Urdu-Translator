@@ -149,9 +149,14 @@ def evaluate(model, dataloader, criterion, device):
 # --- Main Execution Block ---
 
 if __name__ == "__main__":
-    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    PROCESSED_DIR = os.path.join(PROJECT_ROOT, 'data', 'processed')
+    
+    # --- UPDATED PATHS ---
+    # This will now work regardless of your current directory in Colab
+    PROCESSED_DIR = '/content/Urdu-to-Roman-Urdu-Translator/data/processed'
+    MODEL_DIR = '/content/Urdu-to-Roman-Urdu-Translator/models'
 
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    
     train_df = pd.read_csv(os.path.join(PROCESSED_DIR, 'train_data.csv'))
     val_df = pd.read_csv(os.path.join(PROCESSED_DIR, 'validation_data.csv'))
     test_df = pd.read_csv(os.path.join(PROCESSED_DIR, 'test_data.csv'))
@@ -195,9 +200,6 @@ if __name__ == "__main__":
     
     best_valid_loss = float('inf')
     
-    model_dir = os.path.join(PROJECT_ROOT, 'models')
-    os.makedirs(model_dir, exist_ok=True)
-
     for epoch in range(N_EPOCHS):
         start_time = time.time()
         
@@ -214,4 +216,4 @@ if __name__ == "__main__":
         
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
-            torch.save(model.state_dict(), os.path.join(model_dir, 'best_model.pt'))
+            torch.save(model.state_dict(), os.path.join(MODEL_DIR, 'best_model.pt'))
