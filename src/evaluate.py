@@ -12,13 +12,15 @@ import Levenshtein as Lev
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --------------------------
-# Paths (relative)
+# Paths
 # --------------------------
 PROCESSED_DIR = os.path.join("data", "processed")
 VOCAB_DIR = os.path.join(PROCESSED_DIR, "vocab")
 TEST_FILE = os.path.join(PROCESSED_DIR, "test.csv")
-MODELS_DIR = os.path.join("models")
+MODELS_DIR = "models"
 BEST_MODEL = os.path.join(MODELS_DIR, "best_model.pth")
+RESULTS_DIR = "results"
+LOG_FILE = os.path.join(RESULTS_DIR, "experiment_logs.csv")
 
 # --------------------------
 # Dataset Loader
@@ -68,9 +70,8 @@ def evaluate_model():
     model.load_state_dict(torch.load(BEST_MODEL, map_location=DEVICE))
     model.eval()
 
-    bleu_scores, cers = [], []
+    bleu_scores, cers, losses = [], [], []
     criterion = nn.CrossEntropyLoss(ignore_index=0)
-    losses = []
 
     with torch.no_grad():
         for src, trg in test_loader:
@@ -98,18 +99,20 @@ def evaluate_model():
                     cer = Lev.distance(" ".join(true_tokens), " ".join(pred_tokens)) / max(1, len(" ".join(true_tokens)))
                     cers.append(cer)
 
+    # Averages
     avg_loss = np.mean(losses)
     perplexity = np.exp(avg_loss)
-    avg_bleu = np.mean(bleu_scores)
-    avg_cer = np.mean(cers)
+    avg_bleu = np.mean(bleu_scores) if bleu_scores else 0
+    avg_cer = np.mean(cers) if cers else 1
 
+    # Console print
     print(f"Test Results:")
     print(f"- Loss: {avg_loss:.4f}")
     print(f"- Perplexity: {perplexity:.4f}")
     print(f"- BLEU: {avg_bleu:.4f}")
     print(f"- CER: {avg_cer:.4f}")
 
-    # Show some qualitative examples
+    # Sample translations
     print("\n🔹 Sample Translations:")
     for i in range(5):
         urdu = test_ds.df.iloc[i]["urdu_text"]
@@ -125,6 +128,22 @@ def evaluate_model():
         print(f"\nUrdu: {urdu}")
         print(f"Target Roman Urdu: {roman_true}")
         print(f"Predicted Roman Urdu: {roman_pred}")
+
+    # --------------------------
+    # Append results to logs
+    # --------------------------
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    if not os.path.exists(LOG_FILE):
+        pd.DataFrame(columns=["epoch", "train_loss", "val_loss", "val_bleu", "val_cer",
+                              "test_loss", "test_perplexity", "test_bleu", "test_cer"]).to_csv(LOG_FILE, index=False)
+
+    new_log = pd.DataFrame([[None, None, None, None, None,
+                             avg_loss, perplexity, avg_bleu, avg_cer]],
+                           columns=["epoch", "train_loss", "val_loss", "val_bleu", "val_cer",
+                                    "test_loss", "test_perplexity", "test_bleu", "test_cer"])
+    new_log.to_csv(LOG_FILE, mode="a", header=False, index=False)
+    print(f"\n✅ Test results appended to {LOG_FILE}")
+
 
 if __name__ == "__main__":
     evaluate_model()

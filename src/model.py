@@ -2,6 +2,27 @@ import torch
 import torch.nn as nn
 
 # --------------------------
+# Attention (Luong)
+# --------------------------
+class Attention(nn.Module):
+    def __init__(self, hid_dim):
+        super().__init__()
+        self.attn = nn.Linear(hid_dim * 2, hid_dim)
+        self.v = nn.Linear(hid_dim, 1, bias=False)
+
+    def forward(self, hidden, encoder_outputs):
+        # hidden: [batch, hid_dim]
+        # encoder_outputs: [batch, src_len, hid_dim*2] (from BiLSTM)
+        src_len = encoder_outputs.shape[1]
+
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)  # [batch, src_len, hid_dim]
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))  # [batch, src_len, hid_dim]
+        attention = self.v(energy).squeeze(2)  # [batch, src_len]
+
+        return torch.softmax(attention, dim=1)  # normalized weights
+
+
+# --------------------------
 # Encoder (BiLSTM)
 # --------------------------
 class Encoder(nn.Module):
@@ -12,19 +33,18 @@ class Encoder(nn.Module):
             emb_dim, hid_dim, num_layers=n_layers,
             dropout=dropout, bidirectional=True, batch_first=True
         )
-        self.fc = nn.Linear(hid_dim * 2, hid_dim)  # reduce bidirectional output
+        self.fc = nn.Linear(hid_dim * 2, hid_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, src):
         embedded = self.dropout(self.embedding(src))
-        outputs, (hidden, cell) = self.rnn(embedded)
+        outputs, (hidden, cell) = self.rnn(embedded)  # outputs: [batch, src_len, hid_dim*2]
 
-        # hidden, cell from BiLSTM: [num_layers*2, batch, hid_dim]
-        # We only need the last forward and backward hidden states
+        # concat last forward + backward hidden
         hidden_cat = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
         hidden_proj = torch.tanh(self.fc(hidden_cat))  # [batch, hid_dim]
 
-        # Expand to match decoder's 4 layers
+        # repeat across decoder layers
         hidden_proj = hidden_proj.unsqueeze(0).repeat(4, 1, 1)
         cell_proj = torch.zeros_like(hidden_proj)
 
@@ -32,24 +52,38 @@ class Encoder(nn.Module):
 
 
 # --------------------------
-# Decoder (LSTM)
+# Decoder (LSTM + Attention)
 # --------------------------
 class Decoder(nn.Module):
     def __init__(self, output_dim, emb_dim, hid_dim, n_layers=4, dropout=0.3):
         super().__init__()
+        self.output_dim = output_dim
         self.embedding = nn.Embedding(output_dim, emb_dim)
         self.rnn = nn.LSTM(
-            emb_dim, hid_dim, num_layers=n_layers,
+            emb_dim + hid_dim * 2, hid_dim, num_layers=n_layers,
             dropout=dropout, batch_first=True
         )
-        self.fc_out = nn.Linear(hid_dim, output_dim)
+        self.fc_out = nn.Linear(hid_dim * 3, output_dim)
         self.dropout = nn.Dropout(dropout)
+        self.attention = Attention(hid_dim)
 
-    def forward(self, input, hidden, cell):
-        input = input.unsqueeze(1)  # [batch_size, 1]
-        embedded = self.dropout(self.embedding(input))
-        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
-        prediction = self.fc_out(output.squeeze(1))
+    def forward(self, input, hidden, cell, encoder_outputs):
+        input = input.unsqueeze(1)  # [batch, 1]
+        embedded = self.dropout(self.embedding(input))  # [batch, 1, emb_dim]
+
+        # attention
+        attn_weights = self.attention(hidden[-1], encoder_outputs)  # [batch, src_len]
+        attn_weights = attn_weights.unsqueeze(1)  # [batch, 1, src_len]
+
+        context = torch.bmm(attn_weights, encoder_outputs)  # [batch, 1, hid_dim*2]
+
+        rnn_input = torch.cat((embedded, context), dim=2)  # [batch, 1, emb_dim+hid_dim*2]
+        output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
+
+        # predict next token
+        output = torch.cat((output.squeeze(1), context.squeeze(1)), dim=1)  # [batch, hid_dim*3]
+        prediction = self.fc_out(output)  # [batch, output_dim]
+
         return prediction, hidden, cell
 
 
@@ -66,15 +100,15 @@ class Seq2Seq(nn.Module):
     def forward(self, src, trg, teacher_forcing_ratio=0.5):
         batch_size = src.shape[0]
         trg_len = trg.shape[1]
-        trg_vocab_size = self.decoder.embedding.num_embeddings
+        trg_vocab_size = self.decoder.output_dim
 
         outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
 
-        _, hidden, cell = self.encoder(src)
+        encoder_outputs, hidden, cell = self.encoder(src)
         input = trg[:, 0]  # <sos>
 
         for t in range(1, trg_len):
-            output, hidden, cell = self.decoder(input, hidden, cell)
+            output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs)
             outputs[:, t] = output
             teacher_force = torch.rand(1).item() < teacher_forcing_ratio
             top1 = output.argmax(1)
