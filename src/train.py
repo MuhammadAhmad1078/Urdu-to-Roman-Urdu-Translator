@@ -84,7 +84,6 @@ class TranslationDataset(Dataset):
         urdu_text = self.df.iloc[idx]['Urdu']
         roman_urdu_text = self.df.iloc[idx]['Roman_Urdu']
         
-        # Tokenize and convert to indices
         urdu_indices = [self.source_to_idx[char] for char in urdu_text]
         roman_urdu_indices = [self.target_to_idx[char] for char in roman_urdu_text]
         
@@ -94,7 +93,6 @@ def collate_fn(batch, pad_token_id):
     src_list = [item[0] for item in batch]
     trg_list = [item[1] for item in batch]
     
-    # Pad sequences to the same length
     src_padded = nn.utils.rnn.pad_sequence(src_list, batch_first=False, padding_value=pad_token_id)
     trg_padded = nn.utils.rnn.pad_sequence(trg_list, batch_first=False, padding_value=pad_token_id)
     
@@ -137,7 +135,7 @@ def evaluate(model, dataloader, criterion, device):
             src = src.to(device)
             trg = trg.to(device)
             
-            output = model(src, trg, 0) # Turn off teacher forcing
+            output = model(src, trg, 0)
             
             output_dim = output.shape[-1]
             output = output[1:].view(-1, output_dim)
@@ -151,41 +149,35 @@ def evaluate(model, dataloader, criterion, device):
 # --- Main Execution Block ---
 
 if __name__ == "__main__":
-    # Define file paths
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     PROCESSED_DIR = os.path.join(PROJECT_ROOT, 'data', 'processed')
 
-    # Load data and vocabularies
     train_df = pd.read_csv(os.path.join(PROCESSED_DIR, 'train_data.csv'))
     val_df = pd.read_csv(os.path.join(PROCESSED_DIR, 'validation_data.csv'))
     test_df = pd.read_csv(os.path.join(PROCESSED_DIR, 'test_data.csv'))
     
-    # Corrected section: specify encoding for JSON files
     with open(os.path.join(PROCESSED_DIR, 'source_vocab.json'), 'r', encoding='utf-8') as f:
         source_char_to_idx = json.load(f)
     
     with open(os.path.join(PROCESSED_DIR, 'target_vocab.json'), 'r', encoding='utf-8') as f:
         target_char_to_idx = json.load(f)
     
-    # Define vocabulary dimensions
     input_dim = len(source_char_to_idx)
     output_dim = len(target_char_to_idx)
 
-    # Define model hyperparameters
-    EMB_DIM = 256
+    # UPDATED HYPERPARAMETERS
+    EMB_DIM = 512
     HID_DIM = 512
-    N_LAYERS = 2
-    DROPOUT = 0.5
+    N_LAYERS = 4
+    DROPOUT = 0.3
     BATCH_SIZE = 128
-    LEARNING_RATE = 0.001
-    N_EPOCHS = 10
+    LEARNING_RATE = 1e-4
+    N_EPOCHS = 10 # You can increase this for longer training
     CLIP = 1
     
-    # Check for GPU availability
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
-    # Create dataset and dataloader
     pad_token_id = target_char_to_idx['<PAD>']
     
     train_dataset = TranslationDataset(train_df, source_char_to_idx, target_char_to_idx)
@@ -194,20 +186,15 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_fn(b, pad_token_id))
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, collate_fn=lambda b: collate_fn(b, pad_token_id))
     
-    # Corrected Model Initialization
-    # Pass the correct number of layers to the Decoder constructor
     enc = Encoder(input_dim, EMB_DIM, HID_DIM, N_LAYERS, DROPOUT)
     dec = Decoder(output_dim, EMB_DIM, HID_DIM * 2, N_LAYERS, DROPOUT)
     model = Seq2Seq(enc, dec, device).to(device)
 
-    # Initialize optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
     
-    # Training loop
     best_valid_loss = float('inf')
     
-    # Create the 'models' directory if it doesn't exist
     model_dir = os.path.join(PROJECT_ROOT, 'models')
     os.makedirs(model_dir, exist_ok=True)
 
