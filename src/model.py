@@ -2,24 +2,28 @@ import torch
 import torch.nn as nn
 
 # --------------------------
-# Attention (Luong)
+# Attention (Luong-style)
 # --------------------------
 class Attention(nn.Module):
     def __init__(self, hid_dim):
         super().__init__()
-        self.attn = nn.Linear(hid_dim * 2, hid_dim)
+        # concat(hidden: hid_dim, encoder_outputs: hid_dim*2) → total = hid_dim*3
+        self.attn = nn.Linear(hid_dim * 3, hid_dim)
         self.v = nn.Linear(hid_dim, 1, bias=False)
 
     def forward(self, hidden, encoder_outputs):
         # hidden: [batch, hid_dim]
-        # encoder_outputs: [batch, src_len, hid_dim*2] (from BiLSTM)
+        # encoder_outputs: [batch, src_len, hid_dim*2]
         src_len = encoder_outputs.shape[1]
 
+        # repeat hidden across src_len
         hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)  # [batch, src_len, hid_dim]
+
+        # concat hidden + encoder_outputs
         energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))  # [batch, src_len, hid_dim]
         attention = self.v(energy).squeeze(2)  # [batch, src_len]
 
-        return torch.softmax(attention, dim=1)  # normalized weights
+        return torch.softmax(attention, dim=1)  # attention weights
 
 
 # --------------------------
@@ -33,7 +37,7 @@ class Encoder(nn.Module):
             emb_dim, hid_dim, num_layers=n_layers,
             dropout=dropout, bidirectional=True, batch_first=True
         )
-        self.fc = nn.Linear(hid_dim * 2, hid_dim)
+        self.fc = nn.Linear(hid_dim * 2, hid_dim)  # reduce bidirectional output
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, src):
@@ -41,10 +45,10 @@ class Encoder(nn.Module):
         outputs, (hidden, cell) = self.rnn(embedded)  # outputs: [batch, src_len, hid_dim*2]
 
         # concat last forward + backward hidden
-        hidden_cat = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
+        hidden_cat = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)  # [batch, hid_dim*2]
         hidden_proj = torch.tanh(self.fc(hidden_cat))  # [batch, hid_dim]
 
-        # repeat across decoder layers
+        # expand to match decoder layers (n_layers=4)
         hidden_proj = hidden_proj.unsqueeze(0).repeat(4, 1, 1)
         cell_proj = torch.zeros_like(hidden_proj)
 
@@ -63,7 +67,7 @@ class Decoder(nn.Module):
             emb_dim + hid_dim * 2, hid_dim, num_layers=n_layers,
             dropout=dropout, batch_first=True
         )
-        self.fc_out = nn.Linear(hid_dim * 3, output_dim)
+        self.fc_out = nn.Linear(hid_dim + hid_dim * 2, output_dim)
         self.dropout = nn.Dropout(dropout)
         self.attention = Attention(hid_dim)
 
@@ -77,11 +81,13 @@ class Decoder(nn.Module):
 
         context = torch.bmm(attn_weights, encoder_outputs)  # [batch, 1, hid_dim*2]
 
+        # concat embedded + context
         rnn_input = torch.cat((embedded, context), dim=2)  # [batch, 1, emb_dim+hid_dim*2]
+
         output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
 
-        # predict next token
-        output = torch.cat((output.squeeze(1), context.squeeze(1)), dim=1)  # [batch, hid_dim*3]
+        # prediction
+        output = torch.cat((output.squeeze(1), context.squeeze(1)), dim=1)  # [batch, hid_dim+hid_dim*2]
         prediction = self.fc_out(output)  # [batch, output_dim]
 
         return prediction, hidden, cell
