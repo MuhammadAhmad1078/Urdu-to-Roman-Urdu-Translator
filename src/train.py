@@ -152,7 +152,7 @@ if __name__ == "__main__":
     
     # --- UPDATED PATHS ---
     # This will now work regardless of your current directory in Colab
-    PROCESSED_DIR = '/content/Urdu-to-Roman-Urdu-Translator/data/processed'
+    PROCESSED_DIR = '/content/Urdu-to-Roman-Urdu-Translator/data/Processed'
     MODEL_DIR = '/content/Urdu-to-Roman-Urdu-Translator/models'
 
     os.makedirs(MODEL_DIR, exist_ok=True)
