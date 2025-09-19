@@ -7,6 +7,7 @@ import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from model import Encoder, Decoder, Seq2Seq
 import sentencepiece as spm
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -70,22 +71,27 @@ def train_model():
     decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.3)
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
-    optimizer = optim.Adam(model.parameters(), lr=5e-4)
-    criterion = nn.CrossEntropyLoss(ignore_index=0)  # ignore <pad>
+    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-5)
+    # Label smoothing for better generalization
+    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
 
     best_valid_loss = float("inf")
-    patience = 5
+    patience = 7
     counter = 0
 
-    for epoch in range(30):  # max 30 epochs
+    max_epochs = 60
+    for epoch in range(max_epochs):
         # ---------------- Train ----------------
         model.train()
         epoch_loss = 0
+        # Decay teacher forcing from 0.6 → 0.2 over training
+        tf_ratio = max(0.2, 0.6 * (1.0 - epoch / max_epochs))
         for src, trg in train_loader:
             src, trg = src.to(DEVICE), trg.to(DEVICE)
 
             optimizer.zero_grad()
-            output = model(src, trg)
+            output = model(src, trg, teacher_forcing_ratio=tf_ratio)
 
             # Flatten
             output_dim = output.shape[-1]
@@ -116,6 +122,7 @@ def train_model():
         val_loss = val_loss / len(valid_loader)
 
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f}")
+        scheduler.step(val_loss)
 
         # ---------------- Early Stopping ----------------
         if val_loss < best_valid_loss:
