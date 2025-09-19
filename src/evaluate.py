@@ -18,6 +18,16 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class TranslationDataset(torch.utils.data.Dataset):
     def __init__(self, csv_file, max_len=50):
         self.df = pd.read_csv(csv_file)
+        # Filter out malformed rows (e.g., merge conflict markers)
+        def is_valid(cell):
+            if not isinstance(cell, str):
+                return False
+            s = cell.strip()
+            if any(mark in s for mark in [">>>>>>>", "<<<<<<<", "======="]):
+                return False
+            return s.startswith("[") and s.endswith("]")
+
+        self.df = self.df[self.df["urdu_ids"].apply(is_valid) & self.df["roman_ids"].apply(is_valid)].reset_index(drop=True)
         self.max_len = max_len
 
     def __len__(self):
