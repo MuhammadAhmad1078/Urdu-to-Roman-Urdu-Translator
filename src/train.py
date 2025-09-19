@@ -1,91 +1,76 @@
 import os
-import ast
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import pandas as pd
-from torch.utils.data import DataLoader, Dataset
-from model import Encoder, Decoder, Seq2Seq
-import sentencepiece as spm
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
+import sentencepiece as spm
+import math
+import random
+
+from dataset import TranslationDataset, collate_fn
+from model import Encoder, Decoder, Seq2Seq
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --------------------------
-# Dataset Loader (use tokenized CSVs directly)
+# Scheduled Sampling Helper
 # --------------------------
-class TranslationDataset(Dataset):
-    def __init__(self, csv_file, max_len=50):
-        self.df = pd.read_csv(csv_file)
-        # Filter out malformed rows (e.g., merge conflict markers)
-        def is_valid(cell):
-            if not isinstance(cell, str):
-                return False
-            s = cell.strip()
-            if any(mark in s for mark in [">>>>>>>", "<<<<<<<", "======="]):
-                return False
-            return s.startswith("[") and s.endswith("]")
-
-        self.df = self.df[self.df["urdu_ids"].apply(is_valid) & self.df["roman_ids"].apply(is_valid)].reset_index(drop=True)
-        self.max_len = max_len
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        # Parse tokenized IDs from string to list of ints
-        urdu_ids = ast.literal_eval(self.df.iloc[idx]["urdu_ids"])
-        roman_ids = ast.literal_eval(self.df.iloc[idx]["roman_ids"])
-
-        # Truncate if too long
-        urdu_ids = urdu_ids[:self.max_len]
-        roman_ids = roman_ids[:self.max_len]
-
-        return torch.tensor(urdu_ids), torch.tensor(roman_ids)
-
-
-def collate_fn(batch):
-    src, trg = zip(*batch)
-    src = nn.utils.rnn.pad_sequence(src, batch_first=True, padding_value=0)
-    trg = nn.utils.rnn.pad_sequence(trg, batch_first=True, padding_value=0)
-    return src, trg
+def get_teacher_forcing_ratio(epoch, max_epochs):
+    """
+    Scheduled Sampling: start high, decay gradually
+    """
+    start_ratio = 0.9
+    end_ratio = 0.25
+    decay = (start_ratio - end_ratio) / max_epochs
+    return max(end_ratio, start_ratio - epoch * decay)
 
 # --------------------------
-# Training Loop with Early Stopping
+# Train Function
 # --------------------------
 def train_model():
-    # Relative paths
+    # --------------------------
+    # Paths
+    # --------------------------
     PROCESSED_DIR = os.path.join("data", "processed", "tokenized")
-    TRAIN_FILE = os.path.join(PROCESSED_DIR, "train_tok.csv")
-    VALID_FILE = os.path.join(PROCESSED_DIR, "valid_tok.csv")
+    TRAIN_FILE = os.path.join(PROCESSED_DIR, "train_tok.jsonl")
+    VALID_FILE = os.path.join(PROCESSED_DIR, "valid_tok.jsonl")
 
-    # Load datasets
-    train_ds = TranslationDataset(TRAIN_FILE)
-    valid_ds = TranslationDataset(VALID_FILE)
-
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
-    valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
-
-    # Define model dims from SentencePiece vocab sizes to include special tokens
     vocab_dir = os.path.join("data", "processed", "vocab")
     sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "urdu_bpe.model"))
     sp_roman = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "roman_bpe.model"))
     urdu_vocab_size = sp_urdu.get_piece_size()
     roman_vocab_size = sp_roman.get_piece_size()
 
+    # --------------------------
+    # Curriculum: start shorter, expand max_len gradually
+    # --------------------------
+    max_len_start, max_len_end = 30, 50
+    max_epochs = 60
+
+    # --------------------------
+    # Datasets & Loaders
+    # --------------------------
+    train_ds = TranslationDataset(TRAIN_FILE, max_len=max_len_start)
+    valid_ds = TranslationDataset(VALID_FILE, max_len=max_len_start)
+
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
+    valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
+
+    # --------------------------
+    # Model with enhancements
+    # --------------------------
     ENC_EMB_DIM = 512
     DEC_EMB_DIM = 512
-    HID_DIM = 512
+    HID_DIM = 256   # smaller hidden dim to reduce overfitting
 
-    encoder = Encoder(urdu_vocab_size, ENC_EMB_DIM, HID_DIM, n_layers=2, dropout=0.5)
-    decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.5)
+    encoder = Encoder(urdu_vocab_size, ENC_EMB_DIM, HID_DIM, n_layers=2, dropout=0.6)
+    decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.6, tie_embeddings=True)
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    # Label smoothing for better generalization
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
-    max_epochs = 60
-    # OneCycle policy for robust convergence
+
     scheduler = OneCycleLR(
         optimizer,
         max_lr=1e-3,
@@ -101,19 +86,29 @@ def train_model():
     min_delta = 0.01
     counter = 0
 
+    # --------------------------
+    # Training Loop
+    # --------------------------
     for epoch in range(max_epochs):
-        # ---------------- Train ----------------
+        # Adjust curriculum max_len gradually
+        current_max_len = min(max_len_end, max_len_start + (epoch // 10) * 5)
+        train_ds.max_len = current_max_len
+        valid_ds.max_len = current_max_len
+
+        train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
+        valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
+
         model.train()
         epoch_loss = 0
-        # Keep higher TF early, decay later
-        tf_ratio = 0.6 if epoch < 20 else max(0.25, 0.6 * (1.0 - (epoch-20) / (max_epochs-20)))
+
+        tf_ratio = get_teacher_forcing_ratio(epoch, max_epochs)
+
         for src, trg in train_loader:
             src, trg = src.to(DEVICE), trg.to(DEVICE)
 
             optimizer.zero_grad()
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
 
-            # Flatten
             output_dim = output.shape[-1]
             output = output[:,1:].reshape(-1, output_dim)
             trg = trg[:,1:].reshape(-1)
@@ -133,7 +128,7 @@ def train_model():
         with torch.no_grad():
             for src, trg in valid_loader:
                 src, trg = src.to(DEVICE), trg.to(DEVICE)
-                output = model(src, trg, 0)  # no teacher forcing
+                output = model(src, trg, 0)
                 output_dim = output.shape[-1]
                 output = output[:,1:].reshape(-1, output_dim)
                 trg = trg[:,1:].reshape(-1)
@@ -142,9 +137,10 @@ def train_model():
 
         val_loss = val_loss / len(valid_loader)
 
-        print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f}")
+        print(f"Epoch {epoch+1}/{max_epochs} | MaxLen={current_max_len} | TF={tf_ratio:.2f} | "
+              f"Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f}")
 
-        # ---------------- Early Stopping & Adaptation ----------------
+        # ---------------- Early Stopping ----------------
         if (best_valid_loss - val_loss) > min_delta:
             best_valid_loss = val_loss
             counter = 0
@@ -157,7 +153,6 @@ def train_model():
             if counter >= patience:
                 print("⏹️ Early stopping triggered.")
                 break
-
 
 if __name__ == "__main__":
     train_model()
