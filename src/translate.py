@@ -19,8 +19,8 @@ INPUT_DIM = sp_urdu.get_piece_size()
 OUTPUT_DIM = sp_roman.get_piece_size()
 HID_DIM = 512
 
-encoder = Encoder(INPUT_DIM, 256, HID_DIM, n_layers=2, dropout=0.3)
-decoder = Decoder(OUTPUT_DIM, 256, HID_DIM, n_layers=4, dropout=0.3)
+encoder = Encoder(INPUT_DIM, 512, HID_DIM, n_layers=2, dropout=0.5)
+decoder = Decoder(OUTPUT_DIM, 512, HID_DIM, n_layers=4, dropout=0.5)
 model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
 model.load_state_dict(torch.load("models/best_model.pth", map_location=DEVICE))

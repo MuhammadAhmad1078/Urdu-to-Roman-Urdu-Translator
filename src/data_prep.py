@@ -57,30 +57,43 @@ def normalize_urdu(text: str) -> str:
 def build_clean_dataset():
     urdu_lines, roman_lines = [], []
 
-    for root, dirs, files in os.walk(RAW_PATH):
+    # Pair files by relative path: traverse English transliteration files
+    # and find the corresponding Urdu file by swapping the language segment.
+    for root, dirs, files in os.walk(os.path.join(RAW_PATH)):
         for fname in files:
             if fname.startswith("."):
                 continue
             file_path = os.path.join(root, fname)
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    lines = f.read().splitlines()
-                    if os.sep + "ur" + os.sep in file_path:   # Urdu text
-                        for line in lines:
-                            clean = normalize_urdu(line.strip())
-                            if clean:
-                                urdu_lines.append(clean)
-                    elif os.sep + "en" + os.sep in file_path: # Roman Urdu
-                        for line in lines:
-                            clean = normalize_roman(line.strip())
-                            if clean:
-                                roman_lines.append(clean)
-            except Exception as e:
-                print(f"Error reading {file_path}: {e}")
 
-    # Align pairs by index
-    min_len = min(len(urdu_lines), len(roman_lines))
-    urdu_lines, roman_lines = urdu_lines[:min_len], roman_lines[:min_len]
+            # Only drive pairing from 'en' side to ensure 1-1 mapping
+            if os.sep + "en" + os.sep not in file_path:
+                continue
+
+            urdu_path = file_path.replace(os.sep + "en" + os.sep, os.sep + "ur" + os.sep)
+            if not os.path.exists(urdu_path):
+                # Try 'hi' → some repos may use Hindi script dir; skip if not present
+                urdu_path_alt = file_path.replace(os.sep + "en" + os.sep, os.sep + "ur" + os.sep)
+                if not os.path.exists(urdu_path_alt):
+                    # no matching urdu file; skip
+                    continue
+                urdu_path = urdu_path_alt
+
+            try:
+                with open(file_path, "r", encoding="utf-8") as f_en, \
+                     open(urdu_path, "r", encoding="utf-8") as f_ur:
+                    en_lines = f_en.read().splitlines()
+                    ur_lines = f_ur.read().splitlines()
+
+                    # Align per line; normalize; skip empty pairs after normalization
+                    max_len = min(len(en_lines), len(ur_lines))
+                    for i in range(max_len):
+                        ur_clean = normalize_urdu(ur_lines[i].strip())
+                        en_clean = normalize_roman(en_lines[i].strip())
+                        if ur_clean and en_clean:
+                            urdu_lines.append(ur_clean)
+                            roman_lines.append(en_clean)
+            except Exception as e:
+                print(f"Error pairing {file_path} with {urdu_path}: {e}")
 
     # Ensure processed folder exists
     os.makedirs(PROCESSED_DIR, exist_ok=True)

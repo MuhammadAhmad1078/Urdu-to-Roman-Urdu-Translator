@@ -6,6 +6,8 @@ import torch.optim as optim
 import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from model import Encoder, Decoder, Seq2Seq
+import sentencepiece as spm
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -54,35 +56,49 @@ def train_model():
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
 
-    # Define model dims (match vocab sizes from tokenized files)
-    # Find max token ID + 1 (vocab size)
-    urdu_vocab_size = max(max(ast.literal_eval(ids)) for ids in train_ds.df["urdu_ids"]) + 1
-    roman_vocab_size = max(max(ast.literal_eval(ids)) for ids in train_ds.df["roman_ids"]) + 1
+    # Define model dims from SentencePiece vocab sizes to include special tokens
+    vocab_dir = os.path.join("data", "processed", "vocab")
+    sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "urdu_bpe.model"))
+    sp_roman = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "roman_bpe.model"))
+    urdu_vocab_size = sp_urdu.get_piece_size()
+    roman_vocab_size = sp_roman.get_piece_size()
 
-    ENC_EMB_DIM = 256
-    DEC_EMB_DIM = 256
+    ENC_EMB_DIM = 512
+    DEC_EMB_DIM = 512
     HID_DIM = 512
 
-    encoder = Encoder(urdu_vocab_size, ENC_EMB_DIM, HID_DIM, n_layers=2, dropout=0.3)
-    decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.3)
+    encoder = Encoder(urdu_vocab_size, ENC_EMB_DIM, HID_DIM, n_layers=2, dropout=0.5)
+    decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.5)
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
-    optimizer = optim.Adam(model.parameters(), lr=5e-4)
-    criterion = nn.CrossEntropyLoss(ignore_index=0)  # ignore <pad>
+    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-5)
+    # Label smoothing for better generalization
+    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
 
     best_valid_loss = float("inf")
-    patience = 5
+    patience = 7
     counter = 0
+    # Adaptive controls
+    base_dropout = 0.3
+    max_dropout = 0.5
+    current_dropout = base_dropout
 
-    for epoch in range(30):  # max 30 epochs
+    max_epochs = 60
+    for epoch in range(max_epochs):
         # ---------------- Train ----------------
         model.train()
         epoch_loss = 0
+        # Decay teacher forcing from 0.6 → 0.2 over training
+        tf_ratio = max(0.2, 0.6 * (1.0 - epoch / max_epochs))
+        # If on plateau, temporarily boost TF to stabilize
+        if counter > 0:
+            tf_ratio = max(tf_ratio, 0.5)
         for src, trg in train_loader:
             src, trg = src.to(DEVICE), trg.to(DEVICE)
 
             optimizer.zero_grad()
-            output = model(src, trg)
+            output = model(src, trg, teacher_forcing_ratio=tf_ratio)
 
             # Flatten
             output_dim = output.shape[-1]
@@ -113,17 +129,28 @@ def train_model():
         val_loss = val_loss / len(valid_loader)
 
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f}")
+        scheduler.step(val_loss)
 
-        # ---------------- Early Stopping ----------------
+        # ---------------- Early Stopping & Adaptation ----------------
         if val_loss < best_valid_loss:
             best_valid_loss = val_loss
             counter = 0
+            # Reset adaptive dropout on improvement
+            current_dropout = base_dropout
+            model.encoder.dropout.p = current_dropout
+            model.decoder.dropout.p = current_dropout
             os.makedirs("models", exist_ok=True)
             torch.save(model.state_dict(), "models/best_model.pth")
             print("✅ Model improved & saved!")
         else:
             counter += 1
             print(f"⚠️ No improvement. Patience {counter}/{patience}")
+            # Increase regularization slightly on plateau
+            if current_dropout < max_dropout:
+                current_dropout = min(max_dropout, current_dropout + 0.05)
+                model.encoder.dropout.p = current_dropout
+                model.decoder.dropout.p = current_dropout
+                print(f"↘️ Increasing dropout to {current_dropout:.2f} to regularize.")
             if counter >= patience:
                 print("⏹️ Early stopping triggered.")
                 break

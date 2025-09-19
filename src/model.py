@@ -37,20 +37,23 @@ class Encoder(nn.Module):
             emb_dim, hid_dim, num_layers=n_layers,
             dropout=dropout, bidirectional=True, batch_first=True
         )
-        self.fc = nn.Linear(hid_dim * 2, hid_dim)  # reduce bidirectional output
+        self.fc = nn.Linear(hid_dim * 2, hid_dim)  # reduce bidirectional output (hidden)
+        self.fc_cell = nn.Linear(hid_dim * 2, hid_dim)  # project cell state
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, src):
         embedded = self.dropout(self.embedding(src))
         outputs, (hidden, cell) = self.rnn(embedded)  # outputs: [batch, src_len, hid_dim*2]
 
-        # concat last forward + backward hidden
+        # concat last forward + backward hidden and cell
         hidden_cat = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)  # [batch, hid_dim*2]
-        hidden_proj = torch.tanh(self.fc(hidden_cat))  # [batch, hid_dim]
+        cell_cat = torch.cat((cell[-2,:,:], cell[-1,:,:]), dim=1)        # [batch, hid_dim*2]
+        hidden_proj = torch.tanh(self.fc(hidden_cat))                    # [batch, hid_dim]
+        cell_proj = torch.tanh(self.fc_cell(cell_cat))                   # [batch, hid_dim]
 
         # expand to match decoder layers (n_layers=4)
         hidden_proj = hidden_proj.unsqueeze(0).repeat(4, 1, 1)
-        cell_proj = torch.zeros_like(hidden_proj)
+        cell_proj = cell_proj.unsqueeze(0).repeat(4, 1, 1)
 
         return outputs, hidden_proj, cell_proj
 
