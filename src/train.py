@@ -79,6 +79,10 @@ def train_model():
     best_valid_loss = float("inf")
     patience = 7
     counter = 0
+    # Adaptive controls
+    base_dropout = 0.3
+    max_dropout = 0.5
+    current_dropout = base_dropout
 
     max_epochs = 60
     for epoch in range(max_epochs):
@@ -87,6 +91,9 @@ def train_model():
         epoch_loss = 0
         # Decay teacher forcing from 0.6 → 0.2 over training
         tf_ratio = max(0.2, 0.6 * (1.0 - epoch / max_epochs))
+        # If on plateau, temporarily boost TF to stabilize
+        if counter > 0:
+            tf_ratio = max(tf_ratio, 0.5)
         for src, trg in train_loader:
             src, trg = src.to(DEVICE), trg.to(DEVICE)
 
@@ -124,16 +131,26 @@ def train_model():
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f}")
         scheduler.step(val_loss)
 
-        # ---------------- Early Stopping ----------------
+        # ---------------- Early Stopping & Adaptation ----------------
         if val_loss < best_valid_loss:
             best_valid_loss = val_loss
             counter = 0
+            # Reset adaptive dropout on improvement
+            current_dropout = base_dropout
+            model.encoder.dropout.p = current_dropout
+            model.decoder.dropout.p = current_dropout
             os.makedirs("models", exist_ok=True)
             torch.save(model.state_dict(), "models/best_model.pth")
             print("✅ Model improved & saved!")
         else:
             counter += 1
             print(f"⚠️ No improvement. Patience {counter}/{patience}")
+            # Increase regularization slightly on plateau
+            if current_dropout < max_dropout:
+                current_dropout = min(max_dropout, current_dropout + 0.05)
+                model.encoder.dropout.p = current_dropout
+                model.decoder.dropout.p = current_dropout
+                print(f"↘️ Increasing dropout to {current_dropout:.2f} to regularize.")
             if counter >= patience:
                 print("⏹️ Early stopping triggered.")
                 break
