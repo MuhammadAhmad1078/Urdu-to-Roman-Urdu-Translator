@@ -135,8 +135,8 @@ def train_model():
                 preds = outputs.argmax(2).cpu().numpy()
                 trgs = trg.cpu().numpy()
                 for p, t in zip(preds, trgs):
-                    pred_tokens = [sp_roman.id_to_piece(i) for i in p if 0 <= i < sp_roman.get_piece_size()]
-                    true_tokens = [sp_roman.id_to_piece(i) for i in t if 0 <= i < sp_roman.get_piece_size()]
+                    pred_tokens = [sp_roman.id_to_piece(int(i)) for i in p if 0 <= int(i) < sp_roman.get_piece_size()]
+                    true_tokens = [sp_roman.id_to_piece(int(i)) for i in t if 0 <= int(i) < sp_roman.get_piece_size()]
                     if true_tokens and pred_tokens:
                         bleu = sentence_bleu([true_tokens], pred_tokens)
                         bleu_scores.append(bleu)

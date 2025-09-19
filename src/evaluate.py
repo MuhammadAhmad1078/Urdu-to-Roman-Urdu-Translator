@@ -69,13 +69,11 @@ def evaluate_model():
         for src, trg in test_loader:
             src, trg = src.to(DEVICE), trg.to(DEVICE)
 
-            # Encoder pass
             encoder_outputs, hidden, cell = model.encoder(src)
 
-            # Decoder (no teacher forcing)
             batch_size, trg_len = trg.shape
             outputs = torch.zeros(batch_size, trg_len, OUTPUT_DIM).to(DEVICE)
-            input = trg[:, 0]  # <sos>
+            input = trg[:, 0]
 
             for t in range(1, trg_len):
                 output, hidden, cell = model.decoder(input, hidden, cell, encoder_outputs)
@@ -94,9 +92,8 @@ def evaluate_model():
             trgs = trg.cpu().numpy()
 
             for p, t in zip(preds, trgs):
-                pred_tokens = [sp_roman.id_to_piece(i) for i in p if i not in [0, sp_roman.pad_id()]]
-                true_tokens = [sp_roman.id_to_piece(i) for i in t if i not in [0, sp_roman.pad_id()]]
-
+                pred_tokens = [sp_roman.id_to_piece(int(i)) for i in p if 0 <= int(i) < sp_roman.get_piece_size()]
+                true_tokens = [sp_roman.id_to_piece(int(i)) for i in t if 0 <= int(i) < sp_roman.get_piece_size()]
                 if true_tokens and pred_tokens:
                     bleu = sentence_bleu([true_tokens], pred_tokens)
                     bleu_scores.append(bleu)
@@ -105,8 +102,8 @@ def evaluate_model():
 
     avg_loss = np.mean(losses)
     perplexity = np.exp(avg_loss)
-    avg_bleu = np.mean(bleu_scores)
-    avg_cer = np.mean(cers)
+    avg_bleu = np.mean(bleu_scores) if bleu_scores else 0
+    avg_cer = np.mean(cers) if cers else 1
 
     print(f"Test Results:")
     print(f"- Loss: {avg_loss:.4f}")
@@ -114,7 +111,6 @@ def evaluate_model():
     print(f"- BLEU: {avg_bleu:.4f}")
     print(f"- CER: {avg_cer:.4f}")
 
-    # Show qualitative examples
     print("\n🔹 Sample Translations:")
     for i in range(5):
         urdu = test_ds.df.iloc[i]["urdu_text"]
@@ -140,14 +136,12 @@ def evaluate_model():
                 break
             input = torch.tensor([top1]).to(DEVICE)
 
-        roman_pred = sp_roman.decode(outputs[1:])  # skip <sos>
+        roman_pred = sp_roman.decode([int(i) for i in outputs[1:]])  # skip <sos>
 
         print(f"\nUrdu: {urdu}")
         print(f"Target Roman Urdu: {roman_true}")
         print(f"Predicted Roman Urdu: {roman_pred}")
 
-# --------------------------
-# MAIN
-# --------------------------
+
 if __name__ == "__main__":
     evaluate_model()

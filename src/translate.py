@@ -30,15 +30,12 @@ model.eval()
 # Translate Function
 # --------------------------
 def translate_sentence(sentence, max_len=50):
-    # Encode Urdu text
     tokens = [sp_urdu.bos_id()] + sp_urdu.encode(sentence, out_type=int)[:max_len-2] + [sp_urdu.eos_id()]
     src_tensor = torch.tensor(tokens).unsqueeze(0).to(DEVICE)
 
-    # Run encoder
     with torch.no_grad():
         encoder_outputs, hidden, cell = model.encoder(src_tensor)
 
-    # Start decoding
     outputs = [sp_roman.bos_id()]
     input = torch.tensor([outputs[-1]]).to(DEVICE)
 
@@ -51,11 +48,9 @@ def translate_sentence(sentence, max_len=50):
 
         if top1 == sp_roman.eos_id():
             break
-
         input = torch.tensor([top1]).to(DEVICE)
 
-    # Convert IDs back to tokens
-    translation = sp_roman.decode(outputs[1:])  # skip <sos>
+    translation = sp_roman.decode([int(i) for i in outputs[1:]])  # skip <sos>
     return translation
 
 # --------------------------
