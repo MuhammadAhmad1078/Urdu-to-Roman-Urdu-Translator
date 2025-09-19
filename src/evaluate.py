@@ -8,6 +8,7 @@ from model import Encoder, Decoder, Seq2Seq
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 import numpy as np
 import Levenshtein as Lev
+import sentencepiece as spm
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -45,9 +46,12 @@ def evaluate_model():
     test_ds = TranslationDataset(TEST_FILE)
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
 
-    # infer vocab size from dataset
-    urdu_vocab_size = max(max(ast.literal_eval(ids)) for ids in test_ds.df["urdu_ids"]) + 1
-    roman_vocab_size = max(max(ast.literal_eval(ids)) for ids in test_ds.df["roman_ids"]) + 1
+    # vocab sizes from SentencePiece models
+    vocab_dir = os.path.join("data", "processed", "vocab")
+    sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "urdu_bpe.model"))
+    sp_roman = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "roman_bpe.model"))
+    urdu_vocab_size = sp_urdu.get_piece_size()
+    roman_vocab_size = sp_roman.get_piece_size()
 
     encoder = Encoder(urdu_vocab_size, 256, 512, n_layers=2, dropout=0.3)
     decoder = Decoder(roman_vocab_size, 256, 512, n_layers=4, dropout=0.3)
@@ -78,14 +82,31 @@ def evaluate_model():
             trgs = trg.cpu().numpy()
 
             for p, t in zip(preds, trgs):
-                pred_tokens = [str(i) for i in p if i != 0]  # skip padding
-                true_tokens = [str(i) for i in t if i != 0]
+                # Trim at EOS if present
+                def trim_at_eos(seq, eos_id):
+                    out = []
+                    for tok in seq:
+                        if tok == eos_id:
+                            break
+                        if tok != 0:
+                            out.append(int(tok))
+                    return out
 
-                if true_tokens and pred_tokens:
-                    bleu = sentence_bleu([true_tokens], pred_tokens, smoothing_function=smoothie)
+                p_trim = trim_at_eos(p[1:], sp_roman.eos_id())  # skip BOS position
+                t_trim = trim_at_eos(t[1:], sp_roman.eos_id())
+
+                if t_trim and p_trim:
+                    pred_text = sp_roman.decode(p_trim)
+                    true_text = sp_roman.decode(t_trim)
+
+                    # BLEU on word tokens from decoded text
+                    pred_words = pred_text.split()
+                    true_words = true_text.split()
+
+                    bleu = sentence_bleu([true_words], pred_words, smoothing_function=smoothie)
                     bleu_scores.append(bleu)
 
-                    cer = Lev.distance(" ".join(true_tokens), " ".join(pred_tokens)) / max(1, len(" ".join(true_tokens)))
+                    cer = Lev.distance(true_text, pred_text) / max(1, len(true_text))
                     cers.append(cer)
 
     avg_loss = np.mean(losses)
@@ -111,12 +132,22 @@ def evaluate_model():
         output = model(src, trg, 0)
         pred_ids = output.argmax(2).cpu().numpy()[0]
 
-        roman_pred = " ".join([str(i) for i in pred_ids if i != 0])
-        roman_true = " ".join([str(i) for i in roman_true_ids if i != 0])
+        # Trim and decode for readability
+        def trim(seq, eos):
+            out = []
+            for tok in seq[1:]:  # skip BOS
+                if tok == eos:
+                    break
+                if tok != 0:
+                    out.append(int(tok))
+            return out
+
+        roman_pred = sp_roman.decode(trim(pred_ids, sp_roman.eos_id()))
+        roman_true = sp_roman.decode(trim(roman_true_ids, sp_roman.eos_id()))
 
         print(f"\nUrdu IDs: {urdu_ids}")
-        print(f"Target Roman IDs: {roman_true}")
-        print(f"Predicted Roman IDs: {roman_pred}")
+        print(f"Target Roman: {roman_true}")
+        print(f"Predicted Roman: {roman_pred}")
 
 
 if __name__ == "__main__":

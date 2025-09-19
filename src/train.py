@@ -6,6 +6,7 @@ import torch.optim as optim
 import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from model import Encoder, Decoder, Seq2Seq
+import sentencepiece as spm
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -54,10 +55,12 @@ def train_model():
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
 
-    # Define model dims (match vocab sizes from tokenized files)
-    # Find max token ID + 1 (vocab size)
-    urdu_vocab_size = max(max(ast.literal_eval(ids)) for ids in train_ds.df["urdu_ids"]) + 1
-    roman_vocab_size = max(max(ast.literal_eval(ids)) for ids in train_ds.df["roman_ids"]) + 1
+    # Define model dims from SentencePiece vocab sizes to include special tokens
+    vocab_dir = os.path.join("data", "processed", "vocab")
+    sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "urdu_bpe.model"))
+    sp_roman = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "roman_bpe.model"))
+    urdu_vocab_size = sp_urdu.get_piece_size()
+    roman_vocab_size = sp_roman.get_piece_size()
 
     ENC_EMB_DIM = 256
     DEC_EMB_DIM = 256

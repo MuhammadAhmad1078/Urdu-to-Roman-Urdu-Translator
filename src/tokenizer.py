@@ -82,8 +82,11 @@ def load_tokenizers():
 def tokenize_and_save(df, urdu_tok, roman_tok, out_path):
     tokenized_data = []
     for _, row in df.iterrows():
-        urdu_ids = urdu_tok.encode(row["urdu_text"], out_type=int)
-        roman_ids = roman_tok.encode(row["roman_text"], out_type=int)
+        # Add BOS/EOS to both sides for proper seq2seq training
+        urdu_core = urdu_tok.encode(row["urdu_text"], out_type=int)
+        roman_core = roman_tok.encode(row["roman_text"], out_type=int)
+        urdu_ids = [urdu_tok.bos_id()] + urdu_core + [urdu_tok.eos_id()]
+        roman_ids = [roman_tok.bos_id()] + roman_core + [roman_tok.eos_id()]
         tokenized_data.append({
             "urdu_ids": urdu_ids,
             "roman_ids": roman_ids
