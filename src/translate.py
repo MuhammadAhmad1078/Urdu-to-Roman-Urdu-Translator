@@ -29,7 +29,7 @@ model.eval()
 # --------------------------
 # Translate Function
 # --------------------------
-def translate_sentence(sentence, max_len=50):
+def translate_sentence(sentence, max_len=50, no_repeat_ngram_size=3):
     tokens = [sp_urdu.bos_id()] + sp_urdu.encode(sentence, out_type=int)[:max_len-2] + [sp_urdu.eos_id()]
     src_tensor = torch.tensor(tokens).unsqueeze(0).to(DEVICE)
 
@@ -43,7 +43,19 @@ def translate_sentence(sentence, max_len=50):
         with torch.no_grad():
             output, hidden, cell = model.decoder(input, hidden, cell, encoder_outputs)
 
-        top1 = output.argmax(1).item()
+        # Block repeated n-grams
+        logits = output.squeeze(0)
+        if len(outputs) >= no_repeat_ngram_size:
+            n = no_repeat_ngram_size
+            prev_ngram = tuple(outputs[-(n-1):])
+            # Penalize tokens forming an already seen n-gram
+            for i in range(1, len(outputs)-n+2):
+                if tuple(outputs[i:i+n-1]) == prev_ngram:
+                    ban_token = outputs[i+n-1] if i+n-1 < len(outputs) else None
+                    if ban_token is not None:
+                        logits[ban_token] = -1e9
+
+        top1 = int(torch.argmax(logits).item())
         outputs.append(top1)
 
         if top1 == sp_roman.eos_id():

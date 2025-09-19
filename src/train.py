@@ -7,7 +7,7 @@ import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from model import Encoder, Decoder, Seq2Seq
 import sentencepiece as spm
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import OneCycleLR
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -81,29 +81,32 @@ def train_model():
     decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.5)
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
-    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     # Label smoothing for better generalization
     criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+    max_epochs = 60
+    # OneCycle policy for robust convergence
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=1e-3,
+        epochs=max_epochs,
+        steps_per_epoch=max(1, len(train_loader)),
+        pct_start=0.1,
+        div_factor=10.0,
+        final_div_factor=100.0
+    )
 
     best_valid_loss = float("inf")
-    patience = 7
+    patience = 12
+    min_delta = 0.01
     counter = 0
-    # Adaptive controls
-    base_dropout = 0.3
-    max_dropout = 0.5
-    current_dropout = base_dropout
 
-    max_epochs = 60
     for epoch in range(max_epochs):
         # ---------------- Train ----------------
         model.train()
         epoch_loss = 0
-        # Decay teacher forcing from 0.6 → 0.2 over training
-        tf_ratio = max(0.2, 0.6 * (1.0 - epoch / max_epochs))
-        # If on plateau, temporarily boost TF to stabilize
-        if counter > 0:
-            tf_ratio = max(tf_ratio, 0.5)
+        # Keep higher TF early, decay later
+        tf_ratio = 0.6 if epoch < 20 else max(0.25, 0.6 * (1.0 - (epoch-20) / (max_epochs-20)))
         for src, trg in train_loader:
             src, trg = src.to(DEVICE), trg.to(DEVICE)
 
@@ -119,6 +122,7 @@ def train_model():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
             optimizer.step()
+            scheduler.step()
             epoch_loss += loss.item()
 
         train_loss = epoch_loss / len(train_loader)
@@ -139,28 +143,17 @@ def train_model():
         val_loss = val_loss / len(valid_loader)
 
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f}")
-        scheduler.step(val_loss)
 
         # ---------------- Early Stopping & Adaptation ----------------
-        if val_loss < best_valid_loss:
+        if (best_valid_loss - val_loss) > min_delta:
             best_valid_loss = val_loss
             counter = 0
-            # Reset adaptive dropout on improvement
-            current_dropout = base_dropout
-            model.encoder.dropout.p = current_dropout
-            model.decoder.dropout.p = current_dropout
             os.makedirs("models", exist_ok=True)
             torch.save(model.state_dict(), "models/best_model.pth")
             print("✅ Model improved & saved!")
         else:
             counter += 1
             print(f"⚠️ No improvement. Patience {counter}/{patience}")
-            # Increase regularization slightly on plateau
-            if current_dropout < max_dropout:
-                current_dropout = min(max_dropout, current_dropout + 0.05)
-                model.encoder.dropout.p = current_dropout
-                model.decoder.dropout.p = current_dropout
-                print(f"↘️ Increasing dropout to {current_dropout:.2f} to regularize.")
             if counter >= patience:
                 print("⏹️ Early stopping triggered.")
                 break

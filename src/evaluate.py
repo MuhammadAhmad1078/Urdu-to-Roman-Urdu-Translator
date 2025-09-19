@@ -88,7 +88,25 @@ def evaluate_model():
             losses.append(loss.item())
 
             # predictions
-            preds = output.argmax(2).cpu().numpy()
+            # Simple no-repeat trigram blocking at evaluation time
+            logits_full = output.clone()  # [B, T, V]
+            B, T, V = logits_full.shape
+            preds = torch.zeros(B, T, dtype=torch.long)
+            for b in range(B):
+                seen = {}
+                for t in range(T):
+                    logits_t = logits_full[b, t]
+                    if t >= 3:
+                        key = (int(preds[b, t-2].item()), int(preds[b, t-1].item()))
+                        ban = seen.get(key)
+                        if ban is not None:
+                            logits_t[ban] = -1e9
+                    pred_t = int(torch.argmax(logits_t).item())
+                    preds[b, t] = pred_t
+                    if t >= 2:
+                        key2 = (int(preds[b, t-1].item()), int(pred_t))
+                        seen[key2] = pred_t
+            preds = preds.cpu().numpy()
             trgs = trg.cpu().numpy()
 
             for p, t in zip(preds, trgs):
