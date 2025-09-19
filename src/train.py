@@ -7,8 +7,8 @@ from torch.utils.data import DataLoader, Dataset
 from model import Encoder, Decoder, Seq2Seq
 import sentencepiece as spm
 from nltk.translate.bleu_score import sentence_bleu
-import Levenshtein as Lev
 import numpy as np
+import Levenshtein as Lev
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -43,25 +43,16 @@ def collate_fn(batch):
 
 
 # --------------------------
-# Training Loop with Attention + Logging
+# Training Loop with Early Stopping + Metrics
 # --------------------------
 def train_model():
-    # Paths
-    DATA_DIR = os.path.join("data", "processed")
-    VOCAB_DIR = os.path.join(DATA_DIR, "vocab")
-    MODELS_DIR = "models"
-    RESULTS_DIR = "results"
-    LOG_FILE = os.path.join(RESULTS_DIR, "experiment_logs.csv")
-
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-
     # Load tokenizers
+    VOCAB_DIR = os.path.join("data", "processed", "vocab")
     sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(VOCAB_DIR, "urdu_bpe.model"))
     sp_roman = spm.SentencePieceProcessor(model_file=os.path.join(VOCAB_DIR, "roman_bpe.model"))
 
-    train_ds = TranslationDataset(os.path.join(DATA_DIR, "train.csv"), sp_urdu, sp_roman)
-    valid_ds = TranslationDataset(os.path.join(DATA_DIR, "valid.csv"), sp_urdu, sp_roman)
+    train_ds = TranslationDataset("data/processed/train.csv", sp_urdu, sp_roman)
+    valid_ds = TranslationDataset("data/processed/valid.csv", sp_urdu, sp_roman)
 
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
@@ -76,29 +67,29 @@ def train_model():
     decoder = Decoder(OUTPUT_DIM, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.3)
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)  # smaller LR for stability
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)  # ignore <pad>
 
     best_valid_loss = float("inf")
     patience = 5
     counter = 0
 
-    # Create log file if not exists
-    if not os.path.exists(LOG_FILE):
-        pd.DataFrame(columns=["epoch", "train_loss", "val_loss", "val_bleu", "val_cer"]).to_csv(LOG_FILE, index=False)
+    os.makedirs("results", exist_ok=True)
+    log_file = os.path.join("results", "experiment_logs.csv")
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.write("epoch,train_loss,val_loss,bleu,cer\n")
 
-    for epoch in range(30):
-        # --------------------------
+    for epoch in range(40):  # up to 40 epochs, with early stopping
+        # -------------------
         # Training
-        # --------------------------
+        # -------------------
         model.train()
         epoch_loss = 0
-        teacher_forcing_ratio = max(0.5, 0.8 - epoch * 0.02)  # decay over time
-
         for src, trg in train_loader:
             src, trg = src.to(DEVICE), trg.to(DEVICE)
 
             optimizer.zero_grad()
+            teacher_forcing_ratio = max(0.5, 0.8 - epoch * 0.02)
             output = model(src, trg, teacher_forcing_ratio)
 
             output_dim = output.shape[-1]
@@ -113,48 +104,58 @@ def train_model():
 
         train_loss = epoch_loss / len(train_loader)
 
-        # --------------------------
+        # -------------------
         # Validation
-        # --------------------------
+        # -------------------
         model.eval()
         val_loss, bleu_scores, cers = 0, [], []
-
         with torch.no_grad():
             for src, trg in valid_loader:
                 src, trg = src.to(DEVICE), trg.to(DEVICE)
-                output = model(src, trg, 0)  # no teacher forcing
 
-                output_dim = output.shape[-1]
-                out_flat = output[:, 1:].reshape(-1, output_dim)
+                encoder_outputs, hidden, cell = model.encoder(src)
+
+                batch_size, trg_len = trg.shape
+                outputs = torch.zeros(batch_size, trg_len, OUTPUT_DIM).to(DEVICE)
+                input = trg[:, 0]  # <sos>
+
+                for t in range(1, trg_len):
+                    output, hidden, cell = model.decoder(input, hidden, cell, encoder_outputs)
+                    outputs[:, t] = output
+                    input = output.argmax(1)
+
+                # Loss
+                output_dim = outputs.shape[-1]
+                out_flat = outputs[:, 1:].reshape(-1, output_dim)
                 trg_flat = trg[:, 1:].reshape(-1)
-
                 loss = criterion(out_flat, trg_flat)
                 val_loss += loss.item()
 
-                preds = output.argmax(2).cpu().numpy()
+                # Metrics
+                preds = outputs.argmax(2).cpu().numpy()
                 trgs = trg.cpu().numpy()
-
                 for p, t in zip(preds, trgs):
-                    pred_tokens = [sp_roman.id_to_piece(id) for id in p if id not in [0, sp_roman.pad_id()]]
-                    true_tokens = [sp_roman.id_to_piece(id) for id in t if id not in [0, sp_roman.pad_id()]]
-
+                    pred_tokens = [sp_roman.id_to_piece(i) for i in p if 0 <= i < sp_roman.get_piece_size()]
+                    true_tokens = [sp_roman.id_to_piece(i) for i in t if 0 <= i < sp_roman.get_piece_size()]
                     if true_tokens and pred_tokens:
                         bleu = sentence_bleu([true_tokens], pred_tokens)
                         bleu_scores.append(bleu)
                         cer = Lev.distance(" ".join(true_tokens), " ".join(pred_tokens)) / max(1, len(" ".join(true_tokens)))
                         cers.append(cer)
 
-        val_loss = val_loss / len(valid_loader)
+        val_loss /= len(valid_loader)
         avg_bleu = np.mean(bleu_scores) if bleu_scores else 0
         avg_cer = np.mean(cers) if cers else 1
 
-        print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | BLEU: {avg_bleu:.4f} | CER: {avg_cer:.4f}")
+        print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f} | BLEU: {avg_bleu:.4f} | CER: {avg_cer:.4f}")
 
-        # Save best model
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"{epoch+1},{train_loss:.4f},{val_loss:.4f},{avg_bleu:.4f},{avg_cer:.4f}\n")
+
         if val_loss < best_valid_loss:
             best_valid_loss = val_loss
             counter = 0
-            torch.save(model.state_dict(), os.path.join(MODELS_DIR, "best_model.pth"))
+            torch.save(model.state_dict(), "models/best_model.pth")
             print("✅ Model improved & saved!")
         else:
             counter += 1
@@ -162,11 +163,6 @@ def train_model():
             if counter >= patience:
                 print("⏹️ Early stopping triggered.")
                 break
-
-        # Append logs
-        new_log = pd.DataFrame([[epoch+1, train_loss, val_loss, avg_bleu, avg_cer]],
-                               columns=["epoch", "train_loss", "val_loss", "val_bleu", "val_cer"])
-        new_log.to_csv(LOG_FILE, mode="a", header=False, index=False)
 
 
 if __name__ == "__main__":
