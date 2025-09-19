@@ -1,11 +1,11 @@
 import os
+import ast
 import torch
 import torch.nn as nn
 import pandas as pd
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from model import Encoder, Decoder, Seq2Seq
-import sentencepiece as spm
-from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 import numpy as np
 import Levenshtein as Lev
 
@@ -14,25 +14,22 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # --------------------------
 # Dataset Loader
 # --------------------------
-class TranslationDataset(Dataset):
-    def __init__(self, csv_file, sp_urdu, sp_roman, max_len=50):
+class TranslationDataset(torch.utils.data.Dataset):
+    def __init__(self, csv_file, max_len=50):
         self.df = pd.read_csv(csv_file)
-        self.sp_urdu = sp_urdu
-        self.sp_roman = sp_roman
         self.max_len = max_len
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        urdu = self.df.iloc[idx]["urdu_text"]
-        roman = self.df.iloc[idx]["roman_text"]
+        urdu_ids = ast.literal_eval(self.df.iloc[idx]["urdu_ids"])
+        roman_ids = ast.literal_eval(self.df.iloc[idx]["roman_ids"])
 
-        urdu_ids = [self.sp_urdu.bos_id()] + self.sp_urdu.encode(urdu, out_type=int)[:self.max_len-2] + [self.sp_urdu.eos_id()]
-        roman_ids = [self.sp_roman.bos_id()] + self.sp_roman.encode(roman, out_type=int)[:self.max_len-2] + [self.sp_roman.eos_id()]
+        urdu_ids = urdu_ids[:self.max_len]
+        roman_ids = roman_ids[:self.max_len]
 
         return torch.tensor(urdu_ids), torch.tensor(roman_ids)
-
 
 def collate_fn(batch):
     src, trg = zip(*batch)
@@ -44,66 +41,57 @@ def collate_fn(batch):
 # Evaluation
 # --------------------------
 def evaluate_model():
-    VOCAB_DIR = os.path.join("data", "processed", "vocab")
-    sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(VOCAB_DIR, "urdu_bpe.model"))
-    sp_roman = spm.SentencePieceProcessor(model_file=os.path.join(VOCAB_DIR, "roman_bpe.model"))
-
-    test_ds = TranslationDataset("data/processed/test.csv", sp_urdu, sp_roman)
+    TEST_FILE = os.path.join("data", "processed", "tokenized", "test_tok.csv")
+    test_ds = TranslationDataset(TEST_FILE)
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
 
-    INPUT_DIM = sp_urdu.get_piece_size()
-    OUTPUT_DIM = sp_roman.get_piece_size()
+    # infer vocab size from dataset
+    urdu_vocab_size = max(max(ast.literal_eval(ids)) for ids in test_ds.df["urdu_ids"]) + 1
+    roman_vocab_size = max(max(ast.literal_eval(ids)) for ids in test_ds.df["roman_ids"]) + 1
 
-    encoder = Encoder(INPUT_DIM, 256, 512, n_layers=2, dropout=0.3)
-    decoder = Decoder(OUTPUT_DIM, 256, 512, n_layers=4, dropout=0.3)
+    encoder = Encoder(urdu_vocab_size, 256, 512, n_layers=2, dropout=0.3)
+    decoder = Decoder(roman_vocab_size, 256, 512, n_layers=4, dropout=0.3)
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
     model.load_state_dict(torch.load("models/best_model.pth", map_location=DEVICE))
     model.eval()
 
-    bleu_scores, cers = [], []
     criterion = nn.CrossEntropyLoss(ignore_index=0)
-    losses = []
+
+    bleu_scores, cers, losses = [], [], []
+    smoothie = SmoothingFunction().method4
 
     with torch.no_grad():
         for src, trg in test_loader:
             src, trg = src.to(DEVICE), trg.to(DEVICE)
+            output = model(src, trg, 0)  # no teacher forcing
 
-            encoder_outputs, hidden, cell = model.encoder(src)
-
-            batch_size, trg_len = trg.shape
-            outputs = torch.zeros(batch_size, trg_len, OUTPUT_DIM).to(DEVICE)
-            input = trg[:, 0]
-
-            for t in range(1, trg_len):
-                output, hidden, cell = model.decoder(input, hidden, cell, encoder_outputs)
-                outputs[:, t] = output
-                input = output.argmax(1)
-
-            # Loss
-            output_dim = outputs.shape[-1]
-            out_flat = outputs[:, 1:].reshape(-1, output_dim)
-            trg_flat = trg[:, 1:].reshape(-1)
+            # compute loss
+            output_dim = output.shape[-1]
+            out_flat = output[:,1:].reshape(-1, output_dim)
+            trg_flat = trg[:,1:].reshape(-1)
             loss = criterion(out_flat, trg_flat)
             losses.append(loss.item())
 
-            # Metrics
-            preds = outputs.argmax(2).cpu().numpy()
+            # predictions
+            preds = output.argmax(2).cpu().numpy()
             trgs = trg.cpu().numpy()
 
             for p, t in zip(preds, trgs):
-                pred_tokens = [sp_roman.id_to_piece(int(i)) for i in p if 0 <= int(i) < sp_roman.get_piece_size()]
-                true_tokens = [sp_roman.id_to_piece(int(i)) for i in t if 0 <= int(i) < sp_roman.get_piece_size()]
+                pred_tokens = [str(i) for i in p if i != 0]  # skip padding
+                true_tokens = [str(i) for i in t if i != 0]
+
                 if true_tokens and pred_tokens:
-                    bleu = sentence_bleu([true_tokens], pred_tokens)
+                    bleu = sentence_bleu([true_tokens], pred_tokens, smoothing_function=smoothie)
                     bleu_scores.append(bleu)
+
                     cer = Lev.distance(" ".join(true_tokens), " ".join(pred_tokens)) / max(1, len(" ".join(true_tokens)))
                     cers.append(cer)
 
     avg_loss = np.mean(losses)
     perplexity = np.exp(avg_loss)
-    avg_bleu = np.mean(bleu_scores) if bleu_scores else 0
-    avg_cer = np.mean(cers) if cers else 1
+    avg_bleu = np.mean(bleu_scores) if bleu_scores else 0.0
+    avg_cer = np.mean(cers) if cers else 1.0
 
     print(f"Test Results:")
     print(f"- Loss: {avg_loss:.4f}")
@@ -111,36 +99,24 @@ def evaluate_model():
     print(f"- BLEU: {avg_bleu:.4f}")
     print(f"- CER: {avg_cer:.4f}")
 
-    print("\n🔹 Sample Translations:")
+    # show some qualitative samples
+    print("\n🔹 Sample Predictions:")
     for i in range(5):
-        urdu = test_ds.df.iloc[i]["urdu_text"]
-        roman_true = test_ds.df.iloc[i]["roman_text"]
+        urdu_ids = ast.literal_eval(test_ds.df.iloc[i]["urdu_ids"])
+        roman_true_ids = ast.literal_eval(test_ds.df.iloc[i]["roman_ids"])
 
-        tokens = [sp_urdu.bos_id()] + sp_urdu.encode(urdu, out_type=int) + [sp_urdu.eos_id()]
-        src = torch.tensor(tokens).unsqueeze(0).to(DEVICE)
+        src = torch.tensor([urdu_ids]).to(DEVICE)
+        trg = torch.tensor([roman_true_ids]).to(DEVICE)
 
-        with torch.no_grad():
-            encoder_outputs, hidden, cell = model.encoder(src)
+        output = model(src, trg, 0)
+        pred_ids = output.argmax(2).cpu().numpy()[0]
 
-        outputs = [sp_roman.bos_id()]
-        input = torch.tensor([outputs[-1]]).to(DEVICE)
+        roman_pred = " ".join([str(i) for i in pred_ids if i != 0])
+        roman_true = " ".join([str(i) for i in roman_true_ids if i != 0])
 
-        for _ in range(50):
-            with torch.no_grad():
-                output, hidden, cell = model.decoder(input, hidden, cell, encoder_outputs)
-
-            top1 = output.argmax(1).item()
-            outputs.append(top1)
-
-            if top1 == sp_roman.eos_id():
-                break
-            input = torch.tensor([top1]).to(DEVICE)
-
-        roman_pred = sp_roman.decode([int(i) for i in outputs[1:]])  # skip <sos>
-
-        print(f"\nUrdu: {urdu}")
-        print(f"Target Roman Urdu: {roman_true}")
-        print(f"Predicted Roman Urdu: {roman_pred}")
+        print(f"\nUrdu IDs: {urdu_ids}")
+        print(f"Target Roman IDs: {roman_true}")
+        print(f"Predicted Roman IDs: {roman_pred}")
 
 
 if __name__ == "__main__":
