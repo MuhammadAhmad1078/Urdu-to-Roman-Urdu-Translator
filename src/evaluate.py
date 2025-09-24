@@ -125,34 +125,27 @@ def evaluate_model():
             for i in range(src.size(0)):
                 gold_ids = trg[i].cpu().numpy().tolist()
 
+                # Use only greedy decoding (best for speed and reliability)
                 greedy_ids = greedy_decode(model, src[i].unsqueeze(0), sp_roman)
-                beam_ids   = beam_search(model, src[i].unsqueeze(0), sp_roman, beam_size=5)
-                sample_ids = nucleus_sampling(model, src[i].unsqueeze(0), sp_roman, top_p=0.9)
 
                 def trim(seq, eos): 
                     return [int(tok) for tok in seq if tok not in (0, eos)]
 
                 gold_trim = trim(gold_ids, sp_roman.eos_id())
                 greedy_ids = [int(x) for x in greedy_ids]
-                beam_ids   = [int(x) for x in beam_ids]
-                sample_ids = [int(x) for x in sample_ids]
 
                 gold_txt   = sp_roman.decode(gold_trim)
                 greedy_txt = sp_roman.decode(greedy_ids)
-                beam_txt   = sp_roman.decode(beam_ids)
-                sample_txt = sp_roman.decode(sample_ids)
 
                 if gold_trim:
-                    bleu = sentence_bleu([gold_txt.split()], beam_txt.split(), smoothing_function=smoothie)
-                    cer = Lev.distance(gold_txt, beam_txt) / max(1, len(gold_txt))
-                    token_acc = np.mean([p == g for p,g in zip(beam_ids, gold_trim)]) if gold_trim else 0
+                    bleu = sentence_bleu([gold_txt.split()], greedy_txt.split(), smoothing_function=smoothie)
+                    cer = Lev.distance(gold_txt, greedy_txt) / max(1, len(gold_txt))
+                    token_acc = np.mean([p == g for p,g in zip(greedy_ids, gold_trim)]) if gold_trim else 0
                     bleu_scores.append(bleu); cers.append(cer); accs.append(token_acc)
 
                 rows.append({
                     "Gold": gold_txt,
-                    "Greedy": greedy_txt,
-                    "Beam": beam_txt,
-                    "Sample": sample_txt
+                    "Greedy": greedy_txt
                 })
 
     avg_loss = np.mean(losses)
@@ -164,8 +157,8 @@ def evaluate_model():
     print("\n📊 Test Results:")
     print(f"- Loss: {avg_loss:.4f}")
     print(f"- Perplexity: {perplexity:.4f}")
-    print(f"- BLEU (beam): {avg_bleu:.4f}")
-    print(f"- CER  (beam): {avg_cer:.4f}")
+    print(f"- BLEU (greedy): {avg_bleu:.4f}")
+    print(f"- CER  (greedy): {avg_cer:.4f}")
     print(f"- Token Acc: {avg_acc:.4f}")
 
     os.makedirs("models", exist_ok=True)
@@ -175,9 +168,7 @@ def evaluate_model():
     print("\n🔹 Sample Predictions:")
     for row in rows[:5]:
         print(f"Gold:   {row['Gold']}")
-        print(f"Greedy: {row['Greedy']}")
-        print(f"Beam:   {row['Beam']}")
-        print(f"Sample: {row['Sample']}\n")
+        print(f"Greedy: {row['Greedy']}\n")
 
 if __name__ == "__main__":
     evaluate_model()
