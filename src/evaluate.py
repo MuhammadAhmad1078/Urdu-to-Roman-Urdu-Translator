@@ -16,7 +16,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # --------------------------
 class TranslationDataset(torch.utils.data.Dataset):
     def __init__(self, json_file, max_len=50):
-        # ✅ load JSON lines
+        # Load JSON lines
         self.df = pd.read_json(json_file, lines=True)
         self.max_len = max_len
 
@@ -83,7 +83,7 @@ def nucleus_sampling(model, src, sp_roman, top_p=0.9, max_len=50):
         cutoff = np.where(cumsum > top_p)[0][0]
         top_idx = sorted_idx[:cutoff+1]
         top_probs = sorted_probs[:cutoff+1] / sorted_probs[:cutoff+1].sum()
-        next_tok = np.random.choice(top_idx, p=top_probs)
+        next_tok = int(np.random.choice(top_idx, p=top_probs))  # ✅ ensure int
         if next_tok == sp_roman.eos_id(): break
         result.append(next_tok)
         input_tok = torch.tensor([next_tok], device=DEVICE)
@@ -129,8 +129,13 @@ def evaluate_model():
                 beam_ids   = beam_search(model, src[i].unsqueeze(0), sp_roman, beam_size=5)
                 sample_ids = nucleus_sampling(model, src[i].unsqueeze(0), sp_roman, top_p=0.9)
 
-                def trim(seq, eos): return [tok for tok in seq if tok not in (0, eos)]
+                def trim(seq, eos): 
+                    return [int(tok) for tok in seq if tok not in (0, eos)]
+
                 gold_trim = trim(gold_ids, sp_roman.eos_id())
+                greedy_ids = [int(x) for x in greedy_ids]
+                beam_ids   = [int(x) for x in beam_ids]
+                sample_ids = [int(x) for x in sample_ids]
 
                 gold_txt   = sp_roman.decode(gold_trim)
                 greedy_txt = sp_roman.decode(greedy_ids)
