@@ -1,5 +1,4 @@
 import os
-import math
 import random
 import torch
 import torch.nn as nn
@@ -16,14 +15,20 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 1337
 random.seed(SEED); torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
+# --------------------------
+# Teacher Forcing Scheduler
+# --------------------------
 def get_teacher_forcing_ratio(epoch, max_epochs):
     start, end = 0.9, 0.25
     tf = max(end, start - (start - end) * (epoch / max_epochs))
-    if epoch > 20:  # tiny noise floor helps exposure bias
+    if epoch > 20:  # keep a small noise floor
         tf += 0.05
         tf = min(tf, 0.95)
     return tf
 
+# --------------------------
+# Training Function
+# --------------------------
 def train_model():
     # Paths
     TOK_DIR = os.path.join("data", "processed", "tokenized")
@@ -40,13 +45,13 @@ def train_model():
     max_len_start, max_len_end = 30, 50
     max_epochs = 60
 
-    # Datasets & loaders
+    # Datasets
     train_ds = TranslationDataset(TRAIN_FILE, max_len=max_len_start)
     valid_ds = TranslationDataset(VALID_FILE, max_len=max_len_start)
 
     def make_loaders():
         return (
-            DataLoader(train_ds, batch_size=64, shuffle=True,  collate_fn=collate_fn, num_workers=0),
+            DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn, num_workers=0),
             DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn, num_workers=0)
         )
     train_loader, valid_loader = make_loaders()
@@ -54,14 +59,10 @@ def train_model():
     # Model
     ENC_EMB_DIM = 512
     DEC_EMB_DIM = 512
-    HID_DIM = 256  # reduced to fight overfit
+    HID_DIM = 256  # reduced to fight overfitting
 
     encoder = Encoder(urdu_vocab_size, ENC_EMB_DIM, HID_DIM, n_layers=2, dropout=0.6)
-    decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.6, tie_embeddings=True)
-    # set special token ids on decoder (from SentencePiece)
-    decoder.sos_idx = sp_roman.bos_id()
-    decoder.eos_idx = sp_roman.eos_id()
-
+    decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.6)
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -82,21 +83,25 @@ def train_model():
     counter = 0
     history = []
 
+    # --------------------------
+    # Epoch Loop
+    # --------------------------
     for epoch in range(max_epochs):
-        # curriculum: grow max_len every 10 epochs by +5 until 50
+        # Curriculum: grow max_len every 10 epochs
         curr_max_len = min(max_len_end, max_len_start + (epoch // 10) * 5)
         train_ds.max_len = curr_max_len
         valid_ds.max_len = curr_max_len
         train_loader, valid_loader = make_loaders()
 
+        # Training
         model.train()
         tf_ratio = get_teacher_forcing_ratio(epoch, max_epochs)
         tr_loss = 0.0
 
-        for src, trg, src_len, _ in train_loader:
-            src, trg, src_len = src.to(DEVICE), trg.to(DEVICE), src_len.to(DEVICE)
+        for src, trg in train_loader:
+            src, trg = src.to(DEVICE), trg.to(DEVICE)
             optimizer.zero_grad()
-            out = model(src, trg, teacher_forcing_ratio=tf_ratio, lengths=src_len)
+            out = model(src, trg, teacher_forcing_ratio=tf_ratio)
             V = out.shape[-1]
             loss = criterion(out[:, 1:].reshape(-1, V), trg[:, 1:].reshape(-1))
             loss.backward()
@@ -107,23 +112,30 @@ def train_model():
 
         tr_loss /= len(train_loader)
 
-        # validation
+        # Validation
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
-            for src, trg, src_len, _ in valid_loader:
-                src, trg, src_len = src.to(DEVICE), trg.to(DEVICE), src_len.to(DEVICE)
-                out = model(src, trg, teacher_forcing_ratio=0.0, lengths=src_len)
+            for src, trg in valid_loader:
+                src, trg = src.to(DEVICE), trg.to(DEVICE)
+                out = model(src, trg, teacher_forcing_ratio=0.0)
                 V = out.shape[-1]
                 loss = criterion(out[:, 1:].reshape(-1, V), trg[:, 1:].reshape(-1))
                 va_loss += loss.item()
         va_loss /= len(valid_loader)
 
+        # Logging
         print(f"Epoch {epoch+1}/{max_epochs} | MaxLen={curr_max_len} | TF={tf_ratio:.2f} | "
               f"Train: {tr_loss:.4f} | Valid: {va_loss:.4f}")
-        history.append({"epoch": epoch+1, "maxlen": curr_max_len, "tf": tf_ratio, "train_loss": tr_loss, "valid_loss": va_loss})
+        history.append({
+            "epoch": epoch+1,
+            "maxlen": curr_max_len,
+            "tf": tf_ratio,
+            "train_loss": tr_loss,
+            "valid_loss": va_loss
+        })
 
-        # early stopping
+        # Early Stopping
         if va_loss + 1e-6 < best_valid:
             best_valid = va_loss
             counter = 0
@@ -137,7 +149,7 @@ def train_model():
                 print("⏹️ Early stopping triggered.")
                 break
 
-    # save history for plots
+    # Save history
     pd.DataFrame(history).to_csv("models/history.csv", index=False, encoding="utf-8")
 
 if __name__ == "__main__":
