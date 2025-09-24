@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------------------------
-# Attention (Luong-style with scaling)
-# --------------------------
+# ---------- Attention (Luong w/ scaling) ----------
 class Attention(nn.Module):
     def __init__(self, hid_dim, scale=True):
         super().__init__()
@@ -14,101 +12,87 @@ class Attention(nn.Module):
         self.hid_dim = hid_dim
 
     def forward(self, hidden, encoder_outputs):
-        # hidden: [batch, hid_dim]
-        # encoder_outputs: [batch, src_len, hid_dim*2]
-        src_len = encoder_outputs.shape[1]
-
-        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)  # [batch, src_len, hid_dim]
-        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))  # [batch, src_len, hid_dim]
-        attention = self.v(energy).squeeze(2)  # [batch, src_len]
-
+        # hidden: [B, hid], encoder_outputs: [B, S, 2*hid]
+        B, S, _ = encoder_outputs.shape
+        hidden = hidden.unsqueeze(1).repeat(1, S, 1)         # [B,S,hid]
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))  # [B,S,hid]
+        scores = self.v(energy).squeeze(2)                   # [B,S]
         if self.scale:
-            attention = attention / (self.hid_dim ** 0.5)
+            scores = scores / (self.hid_dim ** 0.5)
+        return F.softmax(scores, dim=1)                      # [B,S]
 
-        return F.softmax(attention, dim=1)  # [batch, src_len]
-
-# --------------------------
-# Encoder (BiLSTM + packed sequences)
-# --------------------------
+# ---------- Encoder (BiLSTM + packed) ----------
 class Encoder(nn.Module):
-    def __init__(self, input_dim, emb_dim, hid_dim, n_layers=2, dropout=0.3):
+    def __init__(self, input_dim, emb_dim, hid_dim, n_layers=2, dropout=0.6):
         super().__init__()
         self.embedding = nn.Embedding(input_dim, emb_dim, padding_idx=0)
         self.rnn = nn.LSTM(
             emb_dim, hid_dim, num_layers=n_layers,
-            dropout=dropout if n_layers > 1 else 0,
+            dropout=dropout if n_layers > 1 else 0.0,
             bidirectional=True, batch_first=True
         )
-        self.fc = nn.Linear(hid_dim * 2, hid_dim)
-        self.fc_cell = nn.Linear(hid_dim * 2, hid_dim)
+        self.fc_h = nn.Linear(hid_dim * 2, hid_dim)
+        self.fc_c = nn.Linear(hid_dim * 2, hid_dim)
         self.dropout = nn.Dropout(dropout)
+        self.n_dec_layers = 4  # to match decoder layers
 
     def forward(self, src, lengths=None):
-        embedded = self.dropout(self.embedding(src))
-
-        # Pack padded sequence for efficiency
+        emb = self.dropout(self.embedding(src))
         if lengths is not None:
-            packed = nn.utils.rnn.pack_padded_sequence(embedded, lengths, batch_first=True, enforce_sorted=False)
-            packed_outputs, (hidden, cell) = self.rnn(packed)
-            outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True)
+            packed = nn.utils.rnn.pack_padded_sequence(emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            packed_out, (h, c) = self.rnn(packed)
+            outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
         else:
-            outputs, (hidden, cell) = self.rnn(embedded)
+            outputs, (h, c) = self.rnn(emb)  # outputs: [B,S,2*hid]
 
-        # concat last forward + backward states
-        hidden_cat = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)  # [batch, hid_dim*2]
-        cell_cat = torch.cat((cell[-2,:,:], cell[-1,:,:]), dim=1)
+        # last fwd + last bwd
+        h_cat = torch.cat((h[-2], h[-1]), dim=1)  # [B,2*hid]
+        c_cat = torch.cat((c[-2], c[-1]), dim=1)
+        h0 = torch.tanh(self.fc_h(h_cat)).unsqueeze(0).repeat(self.n_dec_layers, 1, 1)  # [L,B,hid]
+        c0 = torch.tanh(self.fc_c(c_cat)).unsqueeze(0).repeat(self.n_dec_layers, 1, 1)
+        return outputs, h0, c0
 
-        hidden_proj = torch.tanh(self.fc(hidden_cat)).unsqueeze(0).repeat(4, 1, 1)
-        cell_proj = torch.tanh(self.fc_cell(cell_cat)).unsqueeze(0).repeat(4, 1, 1)
-
-        return outputs, hidden_proj, cell_proj
-
-# --------------------------
-# Decoder (LSTM + Attention)
-# --------------------------
+# ---------- Decoder (LSTM + Attention, projection for tying) ----------
 class Decoder(nn.Module):
-    def __init__(self, output_dim, emb_dim, hid_dim, n_layers=4, dropout=0.3, tie_embeddings=False):
+    def __init__(self, output_dim, emb_dim, hid_dim, n_layers=4, dropout=0.6, tie_embeddings=True):
         super().__init__()
         self.output_dim = output_dim
         self.embedding = nn.Embedding(output_dim, emb_dim, padding_idx=0)
         self.rnn = nn.LSTM(
             emb_dim + hid_dim * 2, hid_dim, num_layers=n_layers,
-            dropout=dropout if n_layers > 1 else 0,
+            dropout=dropout if n_layers > 1 else 0.0,
             batch_first=True
         )
-        self.fc_out = nn.Linear(hid_dim + hid_dim * 2, output_dim)
+        # project (hid + 2*hid) -> emb_dim, then to vocab
+        self.pre_out = nn.Linear(hid_dim + hid_dim * 2, emb_dim)
+        self.fc_out  = nn.Linear(emb_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
         self.attention = Attention(hid_dim)
 
         if tie_embeddings:
-            if emb_dim != hid_dim + hid_dim * 2:
-                print("⚠️ Warning: embedding dim and output projection mismatch, cannot tie.")
-            else:
-                self.fc_out.weight = self.embedding.weight
+            # now dims match due to projection layer
+            self.fc_out.weight = self.embedding.weight
 
-        # Special token placeholders (to be set externally in training/eval)
+        # SOS/EOS indices for decoders/decoding utils
         self.sos_idx = 1
         self.eos_idx = 2
 
     def forward(self, input, hidden, cell, encoder_outputs):
-        input = input.unsqueeze(1)  # [batch, 1]
-        embedded = self.dropout(self.embedding(input))  # [batch, 1, emb_dim]
+        # input: [B], hidden/cell: [L,B,hid], encoder_outputs: [B,S,2*hid]
+        inp = input.unsqueeze(1)                              # [B,1]
+        emb = self.dropout(self.embedding(inp))               # [B,1,emb]
 
-        attn_weights = self.attention(hidden[-1], encoder_outputs)  # [batch, src_len]
-        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)  # [batch, 1, hid_dim*2]
+        attn = self.attention(hidden[-1], encoder_outputs)    # [B,S]
+        context = torch.bmm(attn.unsqueeze(1), encoder_outputs)  # [B,1,2*hid]
 
-        rnn_input = torch.cat((embedded, context), dim=2)  # [batch, 1, emb_dim+hid_dim*2]
+        rnn_in = torch.cat((emb, context), dim=2)             # [B,1,emb+2*hid]
+        out, (hidden, cell) = self.rnn(rnn_in, (hidden, cell))# out: [B,1,hid]
 
-        output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
+        fused = torch.cat((out.squeeze(1), context.squeeze(1)), dim=1)  # [B,hid+2*hid]
+        logits = self.fc_out(torch.tanh(self.pre_out(fused)))           # [B,V]
+        return logits, hidden, cell
 
-        output = torch.cat((output.squeeze(1), context.squeeze(1)), dim=1)  # [batch, hid_dim+hid_dim*2]
-        prediction = self.fc_out(output)  # [batch, output_dim]
-
-        return prediction, hidden, cell
-
-# --------------------------
-# Seq2Seq
-# --------------------------
+# ---------- Seq2Seq ----------
 class Seq2Seq(nn.Module):
     def __init__(self, encoder, decoder, device):
         super().__init__()
@@ -117,20 +101,16 @@ class Seq2Seq(nn.Module):
         self.device = device
 
     def forward(self, src, trg, teacher_forcing_ratio=0.5, lengths=None):
-        batch_size = src.shape[0]
-        trg_len = trg.shape[1]
-        trg_vocab_size = self.decoder.output_dim
+        B, T = trg.shape
+        V = self.decoder.output_dim
+        outputs = torch.zeros(B, T, V, device=self.device)
 
-        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
-
-        encoder_outputs, hidden, cell = self.encoder(src, lengths)
-        input = trg[:, 0]  # <sos>
-
-        for t in range(1, trg_len):
-            output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs)
-            outputs[:, t] = output
-            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
-            top1 = output.argmax(1)
-            input = trg[:, t] if teacher_force else top1
-
+        enc_out, h, c = self.encoder(src, lengths=lengths)
+        inp = trg[:, 0]  # BOS
+        for t in range(1, T):
+            logits, h, c = self.decoder(inp, h, c, enc_out)
+            outputs[:, t] = logits
+            teacher = torch.rand(1, device=self.device).item() < teacher_forcing_ratio
+            top1 = logits.argmax(1)
+            inp = trg[:, t] if teacher else top1
         return outputs

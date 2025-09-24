@@ -1,40 +1,34 @@
 import os
+import math
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
 import sentencepiece as spm
-import math
-import random
+import pandas as pd
 
 from dataset import TranslationDataset, collate_fn
 from model import Encoder, Decoder, Seq2Seq
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 1337
+random.seed(SEED); torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 
-# --------------------------
-# Scheduled Sampling Helper
-# --------------------------
 def get_teacher_forcing_ratio(epoch, max_epochs):
-    """
-    Scheduled Sampling: start high, decay gradually
-    """
-    start_ratio = 0.9
-    end_ratio = 0.25
-    decay = (start_ratio - end_ratio) / max_epochs
-    return max(end_ratio, start_ratio - epoch * decay)
+    start, end = 0.9, 0.25
+    tf = max(end, start - (start - end) * (epoch / max_epochs))
+    if epoch > 20:  # tiny noise floor helps exposure bias
+        tf += 0.05
+        tf = min(tf, 0.95)
+    return tf
 
-# --------------------------
-# Train Function
-# --------------------------
 def train_model():
-    # --------------------------
     # Paths
-    # --------------------------
-    PROCESSED_DIR = os.path.join("data", "processed", "tokenized")
-    TRAIN_FILE = os.path.join(PROCESSED_DIR, "train_tok.jsonl")
-    VALID_FILE = os.path.join(PROCESSED_DIR, "valid_tok.jsonl")
+    TOK_DIR = os.path.join("data", "processed", "tokenized")
+    TRAIN_FILE = os.path.join(TOK_DIR, "train_tok.jsonl")
+    VALID_FILE = os.path.join(TOK_DIR, "valid_tok.jsonl")
 
     vocab_dir = os.path.join("data", "processed", "vocab")
     sp_urdu = spm.SentencePieceProcessor(model_file=os.path.join(vocab_dir, "urdu_bpe.model"))
@@ -42,34 +36,36 @@ def train_model():
     urdu_vocab_size = sp_urdu.get_piece_size()
     roman_vocab_size = sp_roman.get_piece_size()
 
-    # --------------------------
-    # Curriculum: start shorter, expand max_len gradually
-    # --------------------------
+    # Curriculum
     max_len_start, max_len_end = 30, 50
     max_epochs = 60
 
-    # --------------------------
-    # Datasets & Loaders
-    # --------------------------
+    # Datasets & loaders
     train_ds = TranslationDataset(TRAIN_FILE, max_len=max_len_start)
     valid_ds = TranslationDataset(VALID_FILE, max_len=max_len_start)
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
-    valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
+    def make_loaders():
+        return (
+            DataLoader(train_ds, batch_size=64, shuffle=True,  collate_fn=collate_fn, num_workers=0),
+            DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn, num_workers=0)
+        )
+    train_loader, valid_loader = make_loaders()
 
-    # --------------------------
-    # Model with enhancements
-    # --------------------------
+    # Model
     ENC_EMB_DIM = 512
     DEC_EMB_DIM = 512
-    HID_DIM = 256   # smaller hidden dim to reduce overfitting
+    HID_DIM = 256  # reduced to fight overfit
 
     encoder = Encoder(urdu_vocab_size, ENC_EMB_DIM, HID_DIM, n_layers=2, dropout=0.6)
     decoder = Decoder(roman_vocab_size, DEC_EMB_DIM, HID_DIM, n_layers=4, dropout=0.6, tie_embeddings=True)
+    # set special token ids on decoder (from SentencePiece)
+    decoder.sos_idx = sp_roman.bos_id()
+    decoder.eos_idx = sp_roman.eos_id()
+
     model = Seq2Seq(encoder, decoder, DEVICE).to(DEVICE)
 
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.05)
 
     scheduler = OneCycleLR(
         optimizer,
@@ -81,68 +77,55 @@ def train_model():
         final_div_factor=100.0
     )
 
-    best_valid_loss = float("inf")
-    patience = 12
-    min_delta = 0.01
+    best_valid = float("inf")
+    patience = 16
     counter = 0
+    history = []
 
-    # --------------------------
-    # Training Loop
-    # --------------------------
     for epoch in range(max_epochs):
-        # Adjust curriculum max_len gradually
-        current_max_len = min(max_len_end, max_len_start + (epoch // 10) * 5)
-        train_ds.max_len = current_max_len
-        valid_ds.max_len = current_max_len
-
-        train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn)
-        valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
+        # curriculum: grow max_len every 10 epochs by +5 until 50
+        curr_max_len = min(max_len_end, max_len_start + (epoch // 10) * 5)
+        train_ds.max_len = curr_max_len
+        valid_ds.max_len = curr_max_len
+        train_loader, valid_loader = make_loaders()
 
         model.train()
-        epoch_loss = 0
-
         tf_ratio = get_teacher_forcing_ratio(epoch, max_epochs)
+        tr_loss = 0.0
 
-        for src, trg in train_loader:
-            src, trg = src.to(DEVICE), trg.to(DEVICE)
-
+        for src, trg, src_len, _ in train_loader:
+            src, trg, src_len = src.to(DEVICE), trg.to(DEVICE), src_len.to(DEVICE)
             optimizer.zero_grad()
-            output = model(src, trg, teacher_forcing_ratio=tf_ratio)
-
-            output_dim = output.shape[-1]
-            output = output[:,1:].reshape(-1, output_dim)
-            trg = trg[:,1:].reshape(-1)
-
-            loss = criterion(output, trg)
+            out = model(src, trg, teacher_forcing_ratio=tf_ratio, lengths=src_len)
+            V = out.shape[-1]
+            loss = criterion(out[:, 1:].reshape(-1, V), trg[:, 1:].reshape(-1))
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
-            epoch_loss += loss.item()
+            tr_loss += loss.item()
 
-        train_loss = epoch_loss / len(train_loader)
+        tr_loss /= len(train_loader)
 
-        # ---------------- Validation ----------------
+        # validation
         model.eval()
-        val_loss = 0
+        va_loss = 0.0
         with torch.no_grad():
-            for src, trg in valid_loader:
-                src, trg = src.to(DEVICE), trg.to(DEVICE)
-                output = model(src, trg, 0)
-                output_dim = output.shape[-1]
-                output = output[:,1:].reshape(-1, output_dim)
-                trg = trg[:,1:].reshape(-1)
-                loss = criterion(output, trg)
-                val_loss += loss.item()
+            for src, trg, src_len, _ in valid_loader:
+                src, trg, src_len = src.to(DEVICE), trg.to(DEVICE), src_len.to(DEVICE)
+                out = model(src, trg, teacher_forcing_ratio=0.0, lengths=src_len)
+                V = out.shape[-1]
+                loss = criterion(out[:, 1:].reshape(-1, V), trg[:, 1:].reshape(-1))
+                va_loss += loss.item()
+        va_loss /= len(valid_loader)
 
-        val_loss = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1}/{max_epochs} | MaxLen={curr_max_len} | TF={tf_ratio:.2f} | "
+              f"Train: {tr_loss:.4f} | Valid: {va_loss:.4f}")
+        history.append({"epoch": epoch+1, "maxlen": curr_max_len, "tf": tf_ratio, "train_loss": tr_loss, "valid_loss": va_loss})
 
-        print(f"Epoch {epoch+1}/{max_epochs} | MaxLen={current_max_len} | TF={tf_ratio:.2f} | "
-              f"Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f}")
-
-        # ---------------- Early Stopping ----------------
-        if (best_valid_loss - val_loss) > min_delta:
-            best_valid_loss = val_loss
+        # early stopping
+        if va_loss + 1e-6 < best_valid:
+            best_valid = va_loss
             counter = 0
             os.makedirs("models", exist_ok=True)
             torch.save(model.state_dict(), "models/best_model.pth")
@@ -153,6 +136,9 @@ def train_model():
             if counter >= patience:
                 print("⏹️ Early stopping triggered.")
                 break
+
+    # save history for plots
+    pd.DataFrame(history).to_csv("models/history.csv", index=False, encoding="utf-8")
 
 if __name__ == "__main__":
     train_model()
