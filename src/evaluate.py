@@ -1,5 +1,4 @@
 import os
-import ast
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -13,26 +12,20 @@ import sentencepiece as spm
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --------------------------
-# Dataset Loader
+# Dataset Loader (JSONL)
 # --------------------------
 class TranslationDataset(torch.utils.data.Dataset):
-    def __init__(self, csv_file, max_len=50):
-        self.df = pd.read_csv(csv_file)
-        def is_valid(cell):
-            if not isinstance(cell, str): return False
-            s = cell.strip()
-            if any(mark in s for mark in [">>>>>>>", "<<<<<<<", "======="]):
-                return False
-            return s.startswith("[") and s.endswith("]")
-
-        self.df = self.df[self.df["urdu_ids"].apply(is_valid) & self.df["roman_ids"].apply(is_valid)].reset_index(drop=True)
+    def __init__(self, json_file, max_len=50):
+        # ✅ load JSON lines
+        self.df = pd.read_json(json_file, lines=True)
         self.max_len = max_len
 
-    def __len__(self): return len(self.df)
+    def __len__(self): 
+        return len(self.df)
 
     def __getitem__(self, idx):
-        urdu_ids = ast.literal_eval(self.df.iloc[idx]["urdu_ids"])
-        roman_ids = ast.literal_eval(self.df.iloc[idx]["roman_ids"])
+        urdu_ids = self.df.iloc[idx]["urdu_ids"]
+        roman_ids = self.df.iloc[idx]["roman_ids"]
         return torch.tensor(urdu_ids[:self.max_len]), torch.tensor(roman_ids[:self.max_len])
 
 def collate_fn(batch):
@@ -48,7 +41,6 @@ def greedy_decode(model, src, sp_roman, max_len=50):
     enc_out, hidden, cell = model.encoder(src)
     input_tok = torch.tensor([sp_roman.bos_id()], device=DEVICE)
     result = []
-
     for _ in range(max_len):
         out, hidden, cell = model.decoder(input_tok, hidden, cell, enc_out)
         top1 = out.argmax(1).item()
@@ -90,8 +82,7 @@ def nucleus_sampling(model, src, sp_roman, top_p=0.9, max_len=50):
         cumsum = np.cumsum(sorted_probs)
         cutoff = np.where(cumsum > top_p)[0][0]
         top_idx = sorted_idx[:cutoff+1]
-        top_probs = sorted_probs[:cutoff+1]
-        top_probs /= top_probs.sum()
+        top_probs = sorted_probs[:cutoff+1] / sorted_probs[:cutoff+1].sum()
         next_tok = np.random.choice(top_idx, p=top_probs)
         if next_tok == sp_roman.eos_id(): break
         result.append(next_tok)
