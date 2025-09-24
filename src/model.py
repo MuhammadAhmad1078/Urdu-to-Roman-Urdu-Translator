@@ -16,14 +16,14 @@ class Attention(nn.Module):
         src_len = encoder_outputs.size(1)
         hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)  # [batch, src_len, hid_dim]
 
-        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))  # [batch, src_len, hid_dim]
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
         attn_weights = self.v(energy).squeeze(2)  # [batch, src_len]
 
         return torch.softmax(attn_weights, dim=1)
 
 
 # --------------------------
-# Encoder (BiLSTM)
+# Encoder (BiLSTM with packing)
 # --------------------------
 class Encoder(nn.Module):
     def __init__(self, input_dim, emb_dim, hid_dim, n_layers=3, dropout=0.6):
@@ -37,11 +37,13 @@ class Encoder(nn.Module):
         self.fc_cell = nn.Linear(hid_dim * 2, hid_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, src):
+    def forward(self, src, lengths):
         embedded = self.dropout(self.embedding(src))
-        outputs, (hidden, cell) = self.rnn(embedded)  # outputs: [batch, src_len, hid_dim*2]
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, lengths.cpu(),
+                                                   batch_first=True, enforce_sorted=False)
+        outputs, (hidden, cell) = self.rnn(packed)
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)
 
-        # concat last forward & backward
         hidden_cat = torch.cat((hidden[-2], hidden[-1]), dim=1)
         cell_cat = torch.cat((cell[-2], cell[-1]), dim=1)
 
@@ -67,29 +69,27 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.attention = Attention(hid_dim)
 
-        # Optional tied embeddings
         if tie_embeddings:
-            if emb_dim == output_dim:  # sanity check
+            if emb_dim == self.fc_out.in_features:
                 self.fc_out.weight = self.embedding.weight
             else:
-                print("⚠️ Embedding dim != output dim, cannot tie embeddings")
+                print("⚠️ Embedding dim mismatch, cannot tie embeddings.")
 
         self.sos_idx = None
         self.eos_idx = None
 
     def forward(self, input, hidden, cell, encoder_outputs):
         input = input.unsqueeze(1)  # [batch, 1]
-        embedded = self.dropout(self.embedding(input))  # [batch, 1, emb_dim]
+        embedded = self.dropout(self.embedding(input))
 
-        # attention
-        attn_weights = self.attention(hidden[-1], encoder_outputs).unsqueeze(1)  # [batch, 1, src_len]
-        context = torch.bmm(attn_weights, encoder_outputs)  # [batch, 1, hid_dim*2]
+        attn_weights = self.attention(hidden[-1], encoder_outputs).unsqueeze(1)
+        context = torch.bmm(attn_weights, encoder_outputs)
 
-        rnn_input = torch.cat((embedded, context), dim=2)  # [batch, 1, emb_dim+hid_dim*2]
+        rnn_input = torch.cat((embedded, context), dim=2)
         output, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
 
-        output = torch.cat((output.squeeze(1), context.squeeze(1)), dim=1)  # [batch, hid_dim+hid_dim*2]
-        prediction = self.fc_out(output)  # [batch, output_dim]
+        output = torch.cat((output.squeeze(1), context.squeeze(1)), dim=1)
+        prediction = self.fc_out(output)
 
         return prediction, hidden, cell
 
@@ -104,14 +104,14 @@ class Seq2Seq(nn.Module):
         self.decoder = decoder
         self.device = device
 
-    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+    def forward(self, src, trg, teacher_forcing_ratio=0.5, lengths=None):
         batch_size = src.size(0)
         trg_len = trg.size(1)
         trg_vocab_size = self.decoder.output_dim
 
         outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
-        encoder_outputs, hidden, cell = self.encoder(src)
-        input = trg[:, 0]  # first <sos>
+        encoder_outputs, hidden, cell = self.encoder(src, lengths)
+        input = trg[:, 0]
 
         for t in range(1, trg_len):
             output, hidden, cell = self.decoder(input, hidden, cell, encoder_outputs)
