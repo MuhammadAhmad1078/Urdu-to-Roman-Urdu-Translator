@@ -98,7 +98,7 @@ def train_model():
         tf_ratio = get_teacher_forcing_ratio(epoch, max_epochs)
         tr_loss = 0.0
 
-        for src, trg in train_loader:
+        for src, trg, _, _ in train_loader:  # ✅ unpack 4 values, ignore 2
             src, trg = src.to(DEVICE), trg.to(DEVICE)
             optimizer.zero_grad()
             out = model(src, trg, teacher_forcing_ratio=tf_ratio)
@@ -116,7 +116,7 @@ def train_model():
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
-            for src, trg in valid_loader:
+            for src, trg, _, _ in valid_loader:  # ✅ unpack 4 values, ignore 2
                 src, trg = src.to(DEVICE), trg.to(DEVICE)
                 out = model(src, trg, teacher_forcing_ratio=0.0)
                 V = out.shape[-1]
